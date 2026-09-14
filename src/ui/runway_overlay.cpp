@@ -17,9 +17,25 @@ namespace {
 constexpr float kKmPerDeg = 111.0f;
 constexpr float kDegToRad = 3.14159265f / 180.0f;
 constexpr size_t kMaxAirportLabels = 32;
+constexpr size_t kAirportBitWords =
+    (data::large_airports::kAirportCount + 31) / 32;
 
-bool s_in_range[data::large_airports::kAirportCount];
-bool s_label_pending[data::large_airports::kAirportCount];
+// Bitsets rather than bool[]: keeps static DRAM free for the frame buffer.
+uint32_t s_in_range[kAirportBitWords];
+uint32_t s_label_pending[kAirportBitWords];
+
+bool airportFlag(const uint32_t* bits, size_t i) {
+  return (bits[i >> 5] >> (i & 31)) & 1u;
+}
+
+void setAirportFlag(uint32_t* bits, size_t i, bool value) {
+  const uint32_t mask = 1u << (i & 31);
+  if (value) {
+    bits[i >> 5] |= mask;
+  } else {
+    bits[i >> 5] &= ~mask;
+  }
+}
 
 bool s_runway_label_ready = false;
 bool s_runway_label_use_vlw = false;
@@ -258,31 +274,32 @@ void drawLargeAirportRunways(lgfx::LGFXBase& gfx) {
   uint16_t label_airports[kMaxAirportLabels];
   size_t label_count = 0;
 
-  for (size_t i = 0; i < data::large_airports::kAirportCount; ++i) {
-    s_in_range[i] = false;
-    s_label_pending[i] = false;
+  for (size_t i = 0; i < kAirportBitWords; ++i) {
+    s_in_range[i] = 0;
+    s_label_pending[i] = 0;
   }
 
   for (size_t i = 0; i < data::large_airports::kRunwayCount; ++i) {
     const auto& rw = data::large_airports::kRunways[i];
     const uint16_t ap_idx = rw.airport_idx;
-    if (!s_in_range[ap_idx]) {
+    if (!airportFlag(s_in_range, ap_idx)) {
       const auto& ap = data::large_airports::kAirports[ap_idx];
       float dx_km = 0.0f;
       float dy_km = 0.0f;
       float dist_km = 0.0f;
       offsetKmFromCenter(e7ToDeg(ap.lat_e7), e7ToDeg(ap.lon_e7), &dx_km, &dy_km,
                          &dist_km);
-      s_in_range[ap_idx] = (dist_km <= radius_km);
+      setAirportFlag(s_in_range, ap_idx, dist_km <= radius_km);
     }
-    if (!s_in_range[ap_idx]) {
+    if (!airportFlag(s_in_range, ap_idx)) {
       continue;
     }
     if (!drawRunwayLine(gfx, rw)) {
       continue;
     }
-    if (!s_label_pending[ap_idx] && label_count < kMaxAirportLabels) {
-      s_label_pending[ap_idx] = true;
+    if (!airportFlag(s_label_pending, ap_idx) &&
+        label_count < kMaxAirportLabels) {
+      setAirportFlag(s_label_pending, ap_idx, true);
       label_airports[label_count++] = ap_idx;
     }
   }

@@ -21,6 +21,9 @@ RUNWAYS_URL = (
     "runways.csv"
 )
 
+# Kept even though OurAirports does not class them as large_airport.
+EXTRA_IDENTS = {"CYMX"}
+
 def fetch_csv(url: str) -> list[dict[str, str]]:
     with urllib.request.urlopen(url, timeout=60) as resp:
         text = resp.read().decode("utf-8")
@@ -67,9 +70,9 @@ def build_dataset() -> tuple[
 
     large_idents: dict[str, tuple[int, int]] = {}
     for a in airports:
-        if a.get("type") != "large_airport":
-            continue
         ident = (a.get("ident") or "").strip()
+        if a.get("type") != "large_airport" and ident not in EXTRA_IDENTS:
+            continue
         if len(ident) != 4:
             continue
         lat = coord_e7(a.get("latitude_deg"))

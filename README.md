@@ -89,6 +89,25 @@ As range decreases (or aircraft approach), targets move inward; beyond-ring dots
 - Poll interval: `kAdsbFetchIntervalMs` (5 s) in `config.h`
 - Ground aircraft hidden by default (`kAdsbShowGroundAircraft`)
 
+## Fork changes (AR)
+
+This fork removes the visible full-screen repaint that happened on every ADS-B update.
+
+**Before** — each update cleared the panel and redrew everything (grid, runways, labels, aircraft), so the whole display visibly repainted every few seconds.
+
+**Now** — the picture is composed in RAM and only the parts that changed are sent to the panel:
+
+1. A full 240×240 frame buffer is reserved at boot, before Wi‑Fi starts, while internal RAM is still unfragmented (16‑bit color, with an 8‑bit fallback if memory is short).
+2. Each frame is drawn into that buffer, and every moving element (aircraft symbol, speed vector, tag, rim dot) reports the box it occupies.
+3. Only those boxes — plus the boxes used by the previous frame, so old positions get erased — are blitted to the display. The grid, runways and labels are never re-sent over SPI.
+4. A full blit happens only when the whole picture changes: first draw and range change.
+
+To free room for the frame buffer, static RAM use was reduced by about 5 KB: the airport in-range flags became bitsets, and the aircraft table is allocated on the heap after the frame buffer.
+
+If the frame buffer cannot be allocated at all, the firmware falls back to the original direct-to-panel drawing, so it still runs.
+
+Result: the radar image stays stable on screen; only the aircraft and their tags update.
+
 ## Configuration
 
 Edit **`include/config.h`** for hardware and behavior:
@@ -151,6 +170,21 @@ src/
 | SCL (SCLK) | GPIO **4** |
 | BOOT (user) | GPIO **9** |
 
+## Wiring (GC9A01 ↔ ESP32 WROOM-32 DevKit, 38-pin)
+
+| Display | ESP32 WROOM-32 |
+|---------|----------------|
+| VCC | 3V3 |
+| GND | GND |
+| RST | GPIO **17** |
+| CS | GPIO **5** (VSPI CS) |
+| DC | GPIO **16** |
+| SDA (MOSI) | GPIO **23** (VSPI MOSI) |
+| SCL (SCLK) | GPIO **18** (VSPI SCLK) |
+| BOOT (user) | on-board **BOOT** button (GPIO **0**) |
+
+GPIO 6–11 are wired to the internal flash and must stay unused. Pins are set per target in `include/config.h`; build this board with `pio run -e wroom32`.
+
 ## Build
 
 ```bash
@@ -191,13 +225,15 @@ Put the board in download mode (hold **BOOT**, tap **RESET**), then flash with C
 | Workflow | When | Output |
 |----------|------|--------|
 | [Build](.github/workflows/build.yml) | Push / PR to `main` | Artifact `plane-radar-supermini` (merged + split `.bin` files, ~90 days) |
-| [Release](.github/workflows/release.yml) | Git tag `v*` (e.g. `v1.0.0`) | GitHub Release asset `plane-radar-v1.0.0.bin` + `.sha256` |
+| [Release](.github/workflows/release.yml) | Git tag `v*` (e.g. `v1.0.0-AR`) | GitHub Release asset `plane-radar-v1.0.0-AR.bin` + `.sha256` |
+
+Tags from this fork carry an **`-AR`** suffix so its builds are easy to tell apart from upstream releases.
 
 To ship a version users can download:
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.0.0-AR
+git push origin v1.0.0-AR
 ```
 
 The release workflow builds firmware in CI and attaches the merged image to the release. Download from **Releases** on GitHub, then flash at **0x0** (ESP32-C3, 4 MB).
@@ -207,3 +243,9 @@ The release workflow builds firmware in CI and attaches the merged image to the 
 - [LovyanGFX](https://github.com/lovyan03/LovyanGFX)
 - [WiFiManager](https://github.com/tzapu/WiFiManager)
 - [ArduinoJson](https://github.com/bblanchon/ArduinoJson)
+
+## Credits
+
+Original project by [MatixYo](https://github.com/MatixYo/ESP32-Plane-Radar).
+
+**Alain Royer (AR)** — added partial screen refresh, so only the aircraft that move are redrawn instead of the whole display, and added support for the ESP32 WROOM-32 DevKit board.

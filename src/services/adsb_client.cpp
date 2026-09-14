@@ -5,6 +5,7 @@
 
 #include <ArduinoJson.h>
 
+#include <cstdlib>
 #include <cstring>
 
 #include "config.h"
@@ -18,9 +19,18 @@ constexpr float kKmPerNm = 1.852f;
 constexpr int kConnectAttemptMs = 200;
 constexpr unsigned long kRequestTimeoutMs = 10000;
 
-Aircraft s_aircraft[kMaxAircraft];
+// Allocated on first use so the display frame buffer gets the large contiguous
+// DRAM block first.
+Aircraft* s_aircraft = nullptr;
 size_t s_aircraft_count = 0;
 PollFn s_poll_fn = nullptr;
+
+bool ensureAircraftTable() {
+  if (s_aircraft == nullptr) {
+    s_aircraft = static_cast<Aircraft*>(calloc(kMaxAircraft, sizeof(Aircraft)));
+  }
+  return s_aircraft != nullptr;
+}
 
 void pollNetwork() {
   if (s_poll_fn != nullptr) {
@@ -252,6 +262,11 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   if (ac.isNull()) {
     s_aircraft_count = 0;
     return true;
+  }
+
+  if (!ensureAircraftTable()) {
+    Serial.println("adsb: aircraft table alloc failed");
+    return false;
   }
 
   size_t n = 0;

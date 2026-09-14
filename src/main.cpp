@@ -70,6 +70,7 @@ void setup() {
 
   bootButtonInit();
   displayInit();
+  ui::radarDisplayInit();
   if (wifiShowsSetupScreenOnBoot()) {
     statusScreenPortal();
   }

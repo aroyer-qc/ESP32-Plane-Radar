@@ -62,6 +62,114 @@ class DrawScope {
   lgfx::LovyanGFX* prev_;
 };
 
+/** Safety margin around tracked boxes to cover anti-aliased edges. */
+constexpr int kDirtyPadPx = 2;
+
+struct DirtyRect {
+  int16_t l;
+  int16_t t;
+  int16_t r;
+  int16_t b;
+};
+
+/** Bounded, non-overlapping set of screen boxes touched by the dynamic layer. */
+class DirtyRegion {
+ public:
+  void clear() { count_ = 0; }
+  size_t count() const { return count_; }
+  const DirtyRect& at(size_t i) const { return rects_[i]; }
+
+  void add(int l, int t, int r, int b) {
+    DirtyRect box;
+    box.l = static_cast<int16_t>(std::max(0, l - kDirtyPadPx));
+    box.t = static_cast<int16_t>(std::max(0, t - kDirtyPadPx));
+    box.r = static_cast<int16_t>(std::min(radar::kSize - 1, r + kDirtyPadPx));
+    box.b = static_cast<int16_t>(std::min(radar::kSize - 1, b + kDirtyPadPx));
+    if (box.l > box.r || box.t > box.b) {
+      return;
+    }
+
+    absorbOverlaps(&box);
+    if (count_ < kMaxRects) {
+      rects_[count_++] = box;
+      return;
+    }
+    mergeInto(&rects_[cheapestMergeIndex(box)], box);
+  }
+
+  void addAll(const DirtyRegion& other) {
+    for (size_t i = 0; i < other.count_; ++i) {
+      const DirtyRect& r = other.rects_[i];
+      add(r.l, r.t, r.r, r.b);
+    }
+  }
+
+ private:
+  static constexpr size_t kMaxRects = 10;
+
+  static int rectArea(const DirtyRect& r) {
+    return (r.r - r.l + 1) * (r.b - r.t + 1);
+  }
+
+  static bool touches(const DirtyRect& a, const DirtyRect& b) {
+    return a.l <= b.r + 1 && b.l <= a.r + 1 && a.t <= b.b + 1 && b.t <= a.b + 1;
+  }
+
+  static void mergeInto(DirtyRect* dst, const DirtyRect& src) {
+    dst->l = std::min(dst->l, src.l);
+    dst->t = std::min(dst->t, src.t);
+    dst->r = std::max(dst->r, src.r);
+    dst->b = std::max(dst->b, src.b);
+  }
+
+  static int unionArea(const DirtyRect& a, const DirtyRect& b) {
+    DirtyRect u = a;
+    mergeInto(&u, b);
+    return rectArea(u);
+  }
+
+  void removeAt(size_t i) { rects_[i] = rects_[--count_]; }
+
+  void absorbOverlaps(DirtyRect* box) {
+    for (size_t i = 0; i < count_;) {
+      if (touches(rects_[i], *box)) {
+        mergeInto(box, rects_[i]);
+        removeAt(i);
+        i = 0;  // the grown box may now touch a rect checked earlier
+        continue;
+      }
+      ++i;
+    }
+  }
+
+  size_t cheapestMergeIndex(const DirtyRect& box) const {
+    size_t best = 0;
+    int best_cost = unionArea(rects_[0], box) - rectArea(rects_[0]);
+    for (size_t i = 1; i < count_; ++i) {
+      const int cost = unionArea(rects_[i], box) - rectArea(rects_[i]);
+      if (cost < best_cost) {
+        best_cost = cost;
+        best = i;
+      }
+    }
+    return best;
+  }
+
+  DirtyRect rects_[kMaxRects];
+  size_t count_ = 0;
+};
+
+DirtyRegion s_dirty_current;
+DirtyRegion s_dirty_previous;
+DirtyRegion* s_dirty_sink = nullptr;
+bool s_panel_matches_frame = false;
+
+void markDirty(int l, int t, int r, int b) {
+  if (s_dirty_sink != nullptr) {
+    s_dirty_sink->add(l, t, r, b);
+  }
+}
+
 int absDiff(int a, int b) { return std::abs(a - b); }
 
 int measureGfxHeight(const lgfx::GFXfont& font) {
@@ -271,8 +379,9 @@ bool beyondRingEdgeDotFromLatLon(float lat, float lon, int* out_x, int* out_y) {
 }
 
 void drawBeyondRingDot(int x, int y) {
-  s_draw->fillSmoothCircle(x, y, radar::kBeyondRingDotRadiusPx,
-                           radar::kColorAircraft);
+  const int r = radar::kBeyondRingDotRadiusPx;
+  markDirty(x - r, y - r, x + r, y + r);
+  s_draw->fillSmoothCircle(x, y, r, radar::kColorAircraft);
 }
 
 void clipPointToOuterRing(int x0, int y0, int* x1, int* y1) {
@@ -346,6 +455,11 @@ void drawHeadingTriangle(int cx, int cy, float heading_deg, uint16_t color) {
   const int wing_x = static_cast<int>(lroundf(cos_h * radar::kAircraftTailHalfPx));
   const int wing_y = static_cast<int>(lroundf(sin_h * radar::kAircraftTailHalfPx));
 
+  const int xs[] = {tip_x, base_x + wing_x, base_x - wing_x};
+  const int ys[] = {tip_y, base_y + wing_y, base_y - wing_y};
+  markDirty(*std::min_element(xs, xs + 3), *std::min_element(ys, ys + 3),
+            *std::max_element(xs, xs + 3), *std::max_element(ys, ys + 3));
+
   s_draw->fillTriangle(tip_x, tip_y, base_x + wing_x, base_y + wing_y,
                        base_x - wing_x, base_y - wing_y, color);
 }
@@ -369,6 +483,12 @@ void drawSpeedVector(int cx, int cy, float heading_deg, float track_deg,
   if (ex == tip_x && ey == tip_y) {
     return;
   }
+
+  const int half =
+      static_cast<int>(radar::kAircraftTrackLineHalfWidth) + 1;
+  markDirty(std::min(tip_x, ex) - half, std::min(tip_y, ey) - half,
+            std::max(tip_x, ex) + half, std::max(tip_y, ey) + half);
+
   s_draw->drawWideLine(tip_x, tip_y, ex, ey, radar::kAircraftTrackLineHalfWidth,
                        color);
 }
@@ -429,6 +549,10 @@ void drawAircraftTag(int x, int y, const services::adsb::Aircraft& plane) {
     s_draw->setTextDatum(textdatum_t::top_right);
   }
   ly = std::max(1, std::min(ly, radar::kSize - block_h - 1));
+  const int block_top = ly;
+
+  const int block_left = tag_on_right ? anchor_x : anchor_x - block_w;
+  markDirty(block_left, block_top, block_left + block_w, block_top + block_h);
 
   if (plane.callsign[0] != '\0') {
     s_draw->setTextColor(radar::kColorLabel, radar::kColorBackground);
@@ -663,40 +787,75 @@ bool ensureFrameSprite() {
   if (s_frame_ready) {
     return true;
   }
-  s_frame.setColorDepth(16);
-  if (!s_frame.createSprite(radar::kSize, radar::kSize)) {
-    Serial.println("radar: frame sprite alloc failed");
-    return false;
+  // A full-screen buffer is required: LovyanGFX resets the clip rect inside
+  // some primitives, so a partial buffer would be written out of bounds.
+  // 16bpp is preferred; 8bpp halves the block when DRAM is too fragmented.
+  for (const uint8_t bpp : {uint8_t{16}, uint8_t{8}}) {
+    s_frame.setColorDepth(bpp);
+    if (s_frame.createSprite(radar::kSize, radar::kSize) != nullptr) {
+      s_frame_ready = true;
+      return true;
+    }
   }
-  s_frame_ready = true;
-  return true;
+  return false;
 }
 
-// Double-buffered frame: composite the grid AND aircraft into the off-screen
-// sprite, then blit it to the panel in a single pushSprite. Because the panel
-// is updated in one pass, labels never show an erase/redraw gap — no flicker.
-void renderFrame() {
+void pushRegion(const DirtyRegion& region) {
+  for (size_t i = 0; i < region.count(); ++i) {
+    const DirtyRect& r = region.at(i);
+    tft.setClipRect(r.l, r.t, r.r - r.l + 1, r.b - r.t + 1);
+    s_frame.pushSprite(0, 0);
+  }
+  tft.clearClipRect();
+}
+
+// The whole frame is composed off-screen, but only the boxes touched this frame
+// or the previous one are blitted, so the static grid is never re-sent over SPI.
+void renderFrame(bool force_full) {
+  s_dirty_current.clear();
+  s_dirty_sink = &s_dirty_current;
   drawStaticGrid(s_frame);  // opens its own DrawScope(s_frame)
   {
     const DrawScope scope(s_frame);
     drawAircraft();
   }
-  s_frame.pushSprite(0, 0);
+  s_dirty_sink = nullptr;
+
+  if (force_full || !s_panel_matches_frame) {
+    s_frame.pushSprite(0, 0);
+  } else {
+    DirtyRegion update = s_dirty_previous;
+    update.addAll(s_dirty_current);
+    pushRegion(update);
+  }
+
+  s_dirty_previous = s_dirty_current;
+  s_panel_matches_frame = true;
   tft.setTextDatum(textdatum_t::top_left);
 }
 
 }  // namespace
+
+void radarDisplayInit() {
+  initPalette();
+  initLabelMetrics();
+  // Reserve the framebuffer while the internal heap is still unfragmented.
+  if (!ensureFrameSprite()) {
+    Serial.printf("radar: no frame buffer (largest free block %u bytes)\n",
+                  ESP.getMaxAllocHeap());
+  }
+}
 
 void radarDisplayDraw() {
   initPalette();
   initLabelMetrics();
 
   if (ensureFrameSprite()) {
-    renderFrame();
+    renderFrame(true);
     return;
   }
 
-  // Fallback when the sprite can't be allocated: draw straight to the panel.
+  // Fallback when the framebuffer can't be allocated: draw straight to the panel.
   const DrawScope scope(tft);
   drawStaticGrid(tft);
   drawAircraft();
@@ -707,7 +866,7 @@ void radarDisplayRefreshAircraft() {
   initPalette();
 
   if (ensureFrameSprite()) {
-    renderFrame();
+    renderFrame(false);
     return;
   }
 
