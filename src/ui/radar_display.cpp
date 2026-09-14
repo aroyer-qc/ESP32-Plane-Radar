@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 
 #include "config.h"
 #include "hardware/display.h"
@@ -525,34 +526,267 @@ int measureTagBlockWidth(const services::adsb::Aircraft& plane) {
   return max_w;
 }
 
-void drawAircraftTag(int x, int y, const services::adsb::Aircraft& plane) {
-  initTagLabelMetrics();
+/** Screen box reserved by one text block. */
+struct TagBox {
+  int16_t l;
+  int16_t t;
+  int16_t r;
+  int16_t b;
+};
+
+struct TagPlacement {
+  TagBox box;
+  bool text_right_aligned = false;
+};
+
+/** Empty space kept between neighbouring text blocks (px). */
+constexpr int kTagSeparationPx = 2;
+/** Anchors are probed all around the blip: headings tried per ring. */
+constexpr int kTagAngleSteps = 16;
+/** Rings pushed progressively further out when every heading is taken. */
+constexpr int kTagRingCount = 4;
+constexpr int kTagRingStepPx = 12;
+constexpr uint16_t kTagCandidateCount = kTagAngleSteps * kTagRingCount;
+constexpr uint16_t kNoTagCandidate = 0xFFFF;
+
+/** Boxes of the fixed UI text (cardinals, range scale) for tags to route around. */
+class StaticTextBoxes {
+ public:
+  void clear() { count_ = 0; }
+  size_t count() const { return count_; }
+  const TagBox& at(size_t i) const { return boxes_[i]; }
+
+  void add(int l, int t, int r, int b) {
+    if (count_ >= kMaxBoxes) {
+      return;
+    }
+    boxes_[count_].l = static_cast<int16_t>(l);
+    boxes_[count_].t = static_cast<int16_t>(t);
+    boxes_[count_].r = static_cast<int16_t>(r);
+    boxes_[count_].b = static_cast<int16_t>(b);
+    ++count_;
+  }
+
+ private:
+  static constexpr size_t kMaxBoxes = 8;
+
+  TagBox boxes_[kMaxBoxes];
+  size_t count_ = 0;
+};
+
+StaticTextBoxes s_static_text;
+
+/** Keeps each aircraft's chosen anchor across polls so tags stop flipping. */
+class TagPlacementMemory {
+ public:
+  /** Marks a new layout pass; used to age out entries when the table is full. */
+  void beginPass() { ++pass_; }
+
+  uint16_t recall(const char* hex) const {
+    const size_t i = find(hex);
+    return i < count_ ? entries_[i].candidate : kNoTagCandidate;
+  }
+
+  void remember(const char* hex, uint16_t candidate) {
+    if (hex == nullptr || hex[0] == '\0') {
+      return;
+    }
+    size_t i = find(hex);
+    if (i >= count_) {
+      i = (count_ < kMaxEntries) ? count_++ : stalestIndex();
+      strncpy(entries_[i].hex, hex, sizeof(entries_[i].hex) - 1);
+      entries_[i].hex[sizeof(entries_[i].hex) - 1] = '\0';
+    }
+    entries_[i].candidate = candidate;
+    entries_[i].pass = pass_;
+  }
+
+ private:
+  static constexpr size_t kMaxEntries = services::adsb::kMaxAircraft;
+
+  struct Entry {
+    char hex[8];
+    uint16_t candidate;
+    uint32_t pass;
+  };
+
+  size_t find(const char* hex) const {
+    if (hex == nullptr || hex[0] == '\0') {
+      return kMaxEntries;
+    }
+    for (size_t i = 0; i < count_; ++i) {
+      if (strcmp(entries_[i].hex, hex) == 0) {
+        return i;
+      }
+    }
+    return kMaxEntries;
+  }
+
+  size_t stalestIndex() const {
+    size_t best = 0;
+    for (size_t i = 1; i < count_; ++i) {
+      if (entries_[i].pass < entries_[best].pass) {
+        best = i;
+      }
+    }
+    return best;
+  }
+
+  Entry entries_[kMaxEntries];
+  size_t count_ = 0;
+  uint32_t pass_ = 0;
+};
+
+/** Hands out text boxes that clear every box already placed this pass. */
+class TagLayout {
+ public:
+  void beginPass() {
+    count_ = 0;
+    for (size_t i = 0; i < s_static_text.count(); ++i) {
+      reserveBox(s_static_text.at(i));
+    }
+    memory_.beginPass();
+  }
+
+  /** Picks the first free anchor around the blip, scanning 360 degrees. */
+  TagPlacement place(const char* hex, int x, int y, int block_w, int block_h) {
+    const uint16_t remembered = memory_.recall(hex);
+    if (remembered != kNoTagCandidate) {
+      const TagPlacement kept = toPlacement(remembered, x, y, block_w, block_h);
+      if (fits(kept.box)) {
+        return reserve(kept);
+      }
+    }
+
+    for (uint16_t c = 0; c < kTagCandidateCount; ++c) {
+      const TagPlacement p = toPlacement(c, x, y, block_w, block_h);
+      if (!fits(p.box)) {
+        continue;
+      }
+      memory_.remember(hex, c);
+      return reserve(p);
+    }
+
+    // Nothing free anywhere: stay on screen and accept the overlap.
+    TagPlacement p = toPlacement(0, x, y, block_w, block_h);
+    clampOnScreen(&p.box);
+    memory_.remember(hex, 0);
+    return reserve(p);
+  }
+
+ private:
+  // Aircraft tags plus the handful of static UI labels.
+  static constexpr size_t kMaxBoxes = services::adsb::kMaxAircraft + 8;
+  static constexpr int kScreenMarginPx = 1;
+
+  /** Heading of the blip-to-center direction; tags start out pointing inward. */
+  static float baseAngle(int x, int y) {
+    const float dx = static_cast<float>(radar::kCenterX - x);
+    const float dy = static_cast<float>(radar::kCenterY - y);
+    if (dx == 0.0f && dy == 0.0f) {
+      return 0.0f;
+    }
+    return atan2f(dy, dx);
+  }
+
+  /** Rank 0 is the base heading, then alternating steps either side of it. */
+  static float angleForRank(int rank, float base) {
+    constexpr float kStep = 6.283185307f / static_cast<float>(kTagAngleSteps);
+    const int step = (rank + 1) / 2;
+    const float sign = (rank % 2) != 0 ? 1.0f : -1.0f;
+    return base + sign * static_cast<float>(step) * kStep;
+  }
+
+  static TagPlacement toPlacement(uint16_t candidate, int x, int y,
+                                  int block_w, int block_h) {
+    const int ring = candidate / kTagAngleSteps;
+    const int rank = candidate % kTagAngleSteps;
+    const float angle = angleForRank(rank, baseAngle(x, y));
+    const float ca = cosf(angle);
+    const float sa = sinf(angle);
+
+    // Push the block out far enough that its edge clears the aircraft symbol.
+    const float clearance =
+        static_cast<float>(radar::kAircraftNoseLenPx +
+                           radar::kAircraftTailHalfPx +
+                           radar::kAircraftLabelGapPx + ring * kTagRingStepPx);
+    const int mid_x =
+        x + static_cast<int>(lroundf(ca * (clearance + block_w * 0.5f)));
+    const int mid_y =
+        y + static_cast<int>(lroundf(sa * (clearance + block_h * 0.5f)));
+
+    TagPlacement p;
+    p.box.l = static_cast<int16_t>(mid_x - block_w / 2);
+    p.box.t = static_cast<int16_t>(mid_y - block_h / 2);
+    p.box.r = static_cast<int16_t>(p.box.l + block_w);
+    p.box.b = static_cast<int16_t>(p.box.t + block_h);
+    p.text_right_aligned = ca < 0.0f;
+    return p;
+  }
+
+  static bool isOnScreen(const TagBox& box) {
+    return box.l >= kScreenMarginPx && box.t >= kScreenMarginPx &&
+           box.r <= radar::kSize - 1 - kScreenMarginPx &&
+           box.b <= radar::kSize - 1 - kScreenMarginPx;
+  }
+
+  static void clampOnScreen(TagBox* box) {
+    const int w = box->r - box->l;
+    const int h = box->b - box->t;
+    const int max_l = radar::kSize - 1 - kScreenMarginPx - w;
+    const int max_t = radar::kSize - 1 - kScreenMarginPx - h;
+    box->l = static_cast<int16_t>(
+        std::max(kScreenMarginPx, std::min<int>(box->l, max_l)));
+    box->t = static_cast<int16_t>(
+        std::max(kScreenMarginPx, std::min<int>(box->t, max_t)));
+    box->r = static_cast<int16_t>(box->l + w);
+    box->b = static_cast<int16_t>(box->t + h);
+  }
+
+  bool fits(const TagBox& box) const { return isOnScreen(box) && isFree(box); }
+
+  bool isFree(const TagBox& box) const {
+    for (size_t i = 0; i < count_; ++i) {
+      const TagBox& o = boxes_[i];
+      if (box.l <= o.r + kTagSeparationPx && o.l <= box.r + kTagSeparationPx &&
+          box.t <= o.b + kTagSeparationPx && o.t <= box.b + kTagSeparationPx) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void reserveBox(const TagBox& box) {
+    if (count_ < kMaxBoxes) {
+      boxes_[count_++] = box;
+    }
+  }
+
+  TagPlacement reserve(const TagPlacement& p) {
+    reserveBox(p.box);
+    return p;
+  }
+
+  TagPlacementMemory memory_;
+  TagBox boxes_[kMaxBoxes];
+  size_t count_ = 0;
+};
+
+TagLayout s_tag_layout;
+
+void drawAircraftTag(const TagPlacement& placement,
+                     const services::adsb::Aircraft& plane) {
   applyTagStyle();
 
   const int line_h = s_draw->fontHeight();
-  const int block_w = measureTagBlockWidth(plane);
-  const int block_h = line_h * 3;
-  int ly = y - block_h / 2;
+  markDirty(placement.box.l, placement.box.t, placement.box.r,
+            placement.box.b);
 
-  const int symbol_half =
-      radar::kAircraftNoseLenPx + radar::kAircraftTailHalfPx;
-  // West (left): tag toward center on the right; east (right): tag on the left.
-  const bool tag_on_right = x < radar::kCenterX;
-  int anchor_x = 0;
-  if (tag_on_right) {
-    anchor_x = x + symbol_half + radar::kAircraftLabelGapPx;
-    anchor_x = std::min(anchor_x, radar::kSize - block_w - 1);
-    s_draw->setTextDatum(textdatum_t::top_left);
-  } else {
-    anchor_x = x - symbol_half - radar::kAircraftLabelGapPx;
-    anchor_x = std::max(anchor_x, block_w + 1);
-    s_draw->setTextDatum(textdatum_t::top_right);
-  }
-  ly = std::max(1, std::min(ly, radar::kSize - block_h - 1));
-  const int block_top = ly;
-
-  const int block_left = tag_on_right ? anchor_x : anchor_x - block_w;
-  markDirty(block_left, block_top, block_left + block_w, block_top + block_h);
+  const int anchor_x =
+      placement.text_right_aligned ? placement.box.r : placement.box.l;
+  s_draw->setTextDatum(placement.text_right_aligned ? textdatum_t::top_right
+                                                    : textdatum_t::top_left);
+  int ly = placement.box.t;
 
   if (plane.callsign[0] != '\0') {
     s_draw->setTextColor(radar::kColorLabel, radar::kColorBackground);
@@ -577,6 +811,7 @@ struct AircraftDrawItem {
   int x = 0;
   int y = 0;
   int dist_sq = 0;
+  TagPlacement tag;
 };
 
 struct BeyondDotDrawItem {
@@ -664,9 +899,21 @@ void drawAircraft() {
                     planes[i].gs_knots, radar::kColorTrackVector);
     drawHeadingTriangle(x, y, planes[i].nose_deg, radar::kColorAircraft);
   }
+
+  initTagLabelMetrics();
+  applyTagStyle();
+  const int tag_block_h = s_draw->fontHeight() * 3;
+  s_tag_layout.beginPass();
+  // Lay out nearest first so close traffic keeps the preferred anchor.
+  for (size_t d = draw_count; d > 0; --d) {
+    AircraftDrawItem& item = items[d - 1];
+    const services::adsb::Aircraft& plane = planes[item.index];
+    item.tag = s_tag_layout.place(plane.hex, item.x, item.y,
+                                  measureTagBlockWidth(plane), tag_block_h);
+  }
+
   for (size_t d = 0; d < draw_count; ++d) {
-    const size_t i = items[d].index;
-    drawAircraftTag(items[d].x, items[d].y, planes[i]);
+    drawAircraftTag(items[d].tag, planes[items[d].index]);
   }
 }
 
@@ -691,6 +938,21 @@ void drawCardinalLabel(const char* text, int x, int y, textdatum_t datum) {
   s_draw->setTextDatum(datum);
   s_draw->setTextColor(radar::kColorLabel, radar::kColorBackground);
   s_draw->drawString(text, x, y);
+
+  const int tw = s_draw->textWidth(text);
+  const int th = s_draw->fontHeight();
+  int left = x - tw / 2;
+  int top = y - th / 2;
+  if (datum == textdatum_t::middle_left) {
+    left = x;
+  } else if (datum == textdatum_t::middle_right) {
+    left = x - tw;
+  } else if (datum == textdatum_t::top_center) {
+    top = y;
+  } else if (datum == textdatum_t::bottom_center) {
+    top = y - th;
+  }
+  s_static_text.add(left, top, left + tw, top + th);
 }
 
 void drawScaleLabelWithBackground(const char* text, int x, int y) {
@@ -709,6 +971,8 @@ void drawScaleLabelWithBackground(const char* text, int x, int y) {
                    radar::kColorBackground);
   s_draw->setTextColor(radar::kColorGrid, radar::kColorBackground);
   s_draw->drawString(text, x, y);
+
+  s_static_text.add(left, top, left + tw + kPadX * 2, top + th + kPadY * 2);
 }
 
 void drawGridRing(int cx, int cy, int r, uint16_t color) {
@@ -766,6 +1030,7 @@ void drawScaleLabel(int cx, int cy, int outer_radius) {
 template <typename Gfx>
 void drawStaticGrid(Gfx& gfx) {
   initLabelMetrics();
+  s_static_text.clear();
   const DrawScope scope(gfx);
   displayFontEnsureLoaded(gfx);
   const int cx = radar::kCenterX;

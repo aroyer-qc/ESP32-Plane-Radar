@@ -10,6 +10,8 @@ struct Aircraft {
   float nose_deg;
   float track_deg;
   float gs_knots;
+  /** ICAO address; stable identity across polls (feed order is not). */
+  char hex[8];
   char callsign[9];
   char type[5];
   char alt[12];
