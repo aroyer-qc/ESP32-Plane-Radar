@@ -171,6 +171,136 @@ void markDirty(int l, int t, int r, int b) {
   }
 }
 
+/** Screen box used both for text layout and for the shapes text should dodge. */
+struct TagBox {
+  int16_t l;
+  int16_t t;
+  int16_t r;
+  int16_t b;
+};
+
+constexpr uint8_t kNoSymbolOwner = 0xFF;
+
+/** Aircraft symbols and track vectors, dodged by tag text whenever room allows. */
+class SymbolObstacles {
+ public:
+  void clear() {
+    box_count_ = 0;
+    segment_count_ = 0;
+  }
+
+  void addSymbol(uint8_t owner, int l, int t, int r, int b) {
+    if (box_count_ >= kMaxBoxes) {
+      return;
+    }
+    boxes_[box_count_].owner = owner;
+    boxes_[box_count_].box.l = static_cast<int16_t>(l);
+    boxes_[box_count_].box.t = static_cast<int16_t>(t);
+    boxes_[box_count_].box.r = static_cast<int16_t>(r);
+    boxes_[box_count_].box.b = static_cast<int16_t>(b);
+    ++box_count_;
+  }
+
+  void addVector(int x0, int y0, int x1, int y1) {
+    if (segment_count_ >= kMaxSegments) {
+      return;
+    }
+    segments_[segment_count_].x0 = static_cast<int16_t>(x0);
+    segments_[segment_count_].y0 = static_cast<int16_t>(y0);
+    segments_[segment_count_].x1 = static_cast<int16_t>(x1);
+    segments_[segment_count_].y1 = static_cast<int16_t>(y1);
+    ++segment_count_;
+  }
+
+  /** True when the box hits a track vector or any symbol other than owner's. */
+  bool blocks(const TagBox& box, uint8_t owner) const {
+    const int l = box.l - kPadPx;
+    const int t = box.t - kPadPx;
+    const int r = box.r + kPadPx;
+    const int b = box.b + kPadPx;
+
+    for (size_t i = 0; i < box_count_; ++i) {
+      if (boxes_[i].owner == owner) {
+        continue;  // a tag may touch the symbol it belongs to
+      }
+      const TagBox& o = boxes_[i].box;
+      if (l <= o.r && o.l <= r && t <= o.b && o.t <= b) {
+        return true;
+      }
+    }
+    for (size_t i = 0; i < segment_count_; ++i) {
+      if (segmentHitsBox(segments_[i], l, t, r, b)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+ private:
+  static constexpr size_t kMaxBoxes = services::adsb::kMaxAircraft;
+  static constexpr size_t kMaxSegments = services::adsb::kMaxAircraft;
+  /** Covers the stroke half-width of the drawn shapes. */
+  static constexpr int kPadPx = 2;
+
+  struct OwnedBox {
+    TagBox box;
+    uint8_t owner;
+  };
+
+  struct Segment {
+    int16_t x0;
+    int16_t y0;
+    int16_t x1;
+    int16_t y1;
+  };
+
+  static bool segmentHitsBox(const Segment& s, int l, int t, int r, int b) {
+    if (std::max(s.x0, s.x1) < l || std::min(s.x0, s.x1) > r ||
+        std::max(s.y0, s.y1) < t || std::min(s.y0, s.y1) > b) {
+      return false;
+    }
+
+    // Liang-Barsky: clip the segment against the box slabs.
+    const float dx = static_cast<float>(s.x1 - s.x0);
+    const float dy = static_cast<float>(s.y1 - s.y0);
+    const float p[4] = {-dx, dx, -dy, dy};
+    const float q[4] = {static_cast<float>(s.x0 - l),
+                        static_cast<float>(r - s.x0),
+                        static_cast<float>(s.y0 - t),
+                        static_cast<float>(b - s.y0)};
+    float enter = 0.0f;
+    float leave = 1.0f;
+    for (int i = 0; i < 4; ++i) {
+      if (p[i] == 0.0f) {
+        if (q[i] < 0.0f) {
+          return false;
+        }
+        continue;
+      }
+      const float u = q[i] / p[i];
+      if (p[i] < 0.0f) {
+        if (u > leave) {
+          return false;
+        }
+        enter = std::max(enter, u);
+      } else {
+        if (u < enter) {
+          return false;
+        }
+        leave = std::min(leave, u);
+      }
+    }
+    return enter <= leave;
+  }
+
+  OwnedBox boxes_[kMaxBoxes];
+  Segment segments_[kMaxSegments];
+  size_t box_count_ = 0;
+  size_t segment_count_ = 0;
+};
+
+SymbolObstacles s_symbols;
+
 int absDiff(int a, int b) { return std::abs(a - b); }
 
 int measureGfxHeight(const lgfx::GFXfont& font) {
@@ -382,6 +512,7 @@ bool beyondRingEdgeDotFromLatLon(float lat, float lon, int* out_x, int* out_y) {
 void drawBeyondRingDot(int x, int y) {
   const int r = radar::kBeyondRingDotRadiusPx;
   markDirty(x - r, y - r, x + r, y + r);
+  s_symbols.addSymbol(kNoSymbolOwner, x - r, y - r, x + r, y + r);
   s_draw->fillSmoothCircle(x, y, r, radar::kColorAircraft);
 }
 
@@ -438,7 +569,8 @@ void noseTip(int cx, int cy, float heading_deg, int* tip_x, int* tip_y) {
   *tip_y = cy - static_cast<int>(lroundf(cosf(rad) * radar::kAircraftNoseLenPx));
 }
 
-void drawHeadingTriangle(int cx, int cy, float heading_deg, uint16_t color) {
+void drawHeadingTriangle(int cx, int cy, float heading_deg, uint16_t color,
+                        uint8_t owner) {
   constexpr float kDegToRad = 0.01745329252f;
   const float rad = heading_deg * kDegToRad;
   const float sin_h = sinf(rad);
@@ -458,8 +590,12 @@ void drawHeadingTriangle(int cx, int cy, float heading_deg, uint16_t color) {
 
   const int xs[] = {tip_x, base_x + wing_x, base_x - wing_x};
   const int ys[] = {tip_y, base_y + wing_y, base_y - wing_y};
-  markDirty(*std::min_element(xs, xs + 3), *std::min_element(ys, ys + 3),
-            *std::max_element(xs, xs + 3), *std::max_element(ys, ys + 3));
+  const int min_x = *std::min_element(xs, xs + 3);
+  const int min_y = *std::min_element(ys, ys + 3);
+  const int max_x = *std::max_element(xs, xs + 3);
+  const int max_y = *std::max_element(ys, ys + 3);
+  markDirty(min_x, min_y, max_x, max_y);
+  s_symbols.addSymbol(owner, min_x, min_y, max_x, max_y);
 
   s_draw->fillTriangle(tip_x, tip_y, base_x + wing_x, base_y + wing_y,
                        base_x - wing_x, base_y - wing_y, color);
@@ -489,6 +625,7 @@ void drawSpeedVector(int cx, int cy, float heading_deg, float track_deg,
       static_cast<int>(radar::kAircraftTrackLineHalfWidth) + 1;
   markDirty(std::min(tip_x, ex) - half, std::min(tip_y, ey) - half,
             std::max(tip_x, ex) + half, std::max(tip_y, ey) + half);
+  s_symbols.addVector(tip_x, tip_y, ex, ey);
 
   s_draw->drawWideLine(tip_x, tip_y, ex, ey, radar::kAircraftTrackLineHalfWidth,
                        color);
@@ -527,13 +664,6 @@ int measureTagBlockWidth(const services::adsb::Aircraft& plane) {
 }
 
 /** Screen box reserved by one text block. */
-struct TagBox {
-  int16_t l;
-  int16_t t;
-  int16_t r;
-  int16_t b;
-};
-
 struct TagPlacement {
   TagBox box;
   bool text_right_aligned = false;
@@ -649,22 +779,28 @@ class TagLayout {
   }
 
   /** Picks the first free anchor around the blip, scanning 360 degrees. */
-  TagPlacement place(const char* hex, int x, int y, int block_w, int block_h) {
-    const uint16_t remembered = memory_.recall(hex);
-    if (remembered != kNoTagCandidate) {
-      const TagPlacement kept = toPlacement(remembered, x, y, block_w, block_h);
-      if (fits(kept.box)) {
-        return reserve(kept);
+  TagPlacement place(const char* hex, uint8_t owner, int x, int y,
+                     int block_w, int block_h) {
+    // First pass also dodges symbols and track vectors; second keeps text only.
+    for (int pass = 0; pass < 2; ++pass) {
+      const bool dodge_symbols = pass == 0;
+      const uint16_t remembered = memory_.recall(hex);
+      if (remembered != kNoTagCandidate) {
+        const TagPlacement kept =
+            toPlacement(remembered, x, y, block_w, block_h);
+        if (fits(kept.box, owner, dodge_symbols)) {
+          return reserve(kept);
+        }
       }
-    }
 
-    for (uint16_t c = 0; c < kTagCandidateCount; ++c) {
-      const TagPlacement p = toPlacement(c, x, y, block_w, block_h);
-      if (!fits(p.box)) {
-        continue;
+      for (uint16_t c = 0; c < kTagCandidateCount; ++c) {
+        const TagPlacement p = toPlacement(c, x, y, block_w, block_h);
+        if (!fits(p.box, owner, dodge_symbols)) {
+          continue;
+        }
+        memory_.remember(hex, c);
+        return reserve(p);
       }
-      memory_.remember(hex, c);
-      return reserve(p);
     }
 
     // Nothing free anywhere: stay on screen and accept the overlap.
@@ -743,7 +879,12 @@ class TagLayout {
     box->b = static_cast<int16_t>(box->t + h);
   }
 
-  bool fits(const TagBox& box) const { return isOnScreen(box) && isFree(box); }
+  bool fits(const TagBox& box, uint8_t owner, bool dodge_symbols) const {
+    if (!isOnScreen(box) || !isFree(box)) {
+      return false;
+    }
+    return !dodge_symbols || !s_symbols.blocks(box, owner);
+  }
 
   bool isFree(const TagBox& box) const {
     for (size_t i = 0; i < count_; ++i) {
@@ -846,6 +987,7 @@ void sortBeyondDotsFarFirst(BeyondDotDrawItem* items, size_t count) {
 
 void drawAircraft() {
   initLabelMetrics();
+  s_symbols.clear();
 
   const size_t n = services::adsb::aircraftCount();
   const services::adsb::Aircraft* planes = services::adsb::aircraftList();
@@ -897,7 +1039,8 @@ void drawAircraft() {
     const int y = items[d].y;
     drawSpeedVector(x, y, planes[i].nose_deg, planes[i].track_deg,
                     planes[i].gs_knots, radar::kColorTrackVector);
-    drawHeadingTriangle(x, y, planes[i].nose_deg, radar::kColorAircraft);
+    drawHeadingTriangle(x, y, planes[i].nose_deg, radar::kColorAircraft,
+                        static_cast<uint8_t>(i));
   }
 
   initTagLabelMetrics();
@@ -908,8 +1051,9 @@ void drawAircraft() {
   for (size_t d = draw_count; d > 0; --d) {
     AircraftDrawItem& item = items[d - 1];
     const services::adsb::Aircraft& plane = planes[item.index];
-    item.tag = s_tag_layout.place(plane.hex, item.x, item.y,
-                                  measureTagBlockWidth(plane), tag_block_h);
+    item.tag = s_tag_layout.place(plane.hex, static_cast<uint8_t>(item.index),
+                                  item.x, item.y, measureTagBlockWidth(plane),
+                                  tag_block_h);
   }
 
   for (size_t d = 0; d < draw_count; ++d) {
