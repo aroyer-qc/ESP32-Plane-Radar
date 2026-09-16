@@ -89,6 +89,11 @@ char s_runways_checkbox_attrs[32] = "type=\"checkbox\"";
 WiFiManagerParameter s_param_runways("show_runways", "Show airport runways", "T", 2,
                                      s_runways_checkbox_attrs, WFM_LABEL_AFTER);
 
+char s_alt_meters_checkbox_attrs[32] = "type=\"checkbox\"";
+WiFiManagerParameter s_param_alt_meters("alt_meters", "Display altitude in meters", "T",
+                                        2, s_alt_meters_checkbox_attrs,
+                                        WFM_LABEL_AFTER);
+
 constexpr int kSsidParamLen = 32;
 constexpr int kPassParamLen = 64;
 constexpr char kBackupSsidAttrs[] = " maxlength=\"32\"";
@@ -230,6 +235,9 @@ void refreshPortalParamDefaults() {
   snprintf(s_runways_checkbox_attrs, sizeof(s_runways_checkbox_attrs),
            "type=\"checkbox\"%s", ui::radar::showRunways() ? " checked" : "");
   s_param_runways.setValue("T", 2);
+  snprintf(s_alt_meters_checkbox_attrs, sizeof(s_alt_meters_checkbox_attrs),
+           "type=\"checkbox\"%s", ui::radar::altitudeMeters() ? " checked" : "");
+  s_param_alt_meters.setValue("T", 2);
   const String ssid2 = backupSsid();
   s_param_backup_ssid.setValue(ssid2.c_str(), kSsidParamLen);
   // Never echo the stored password back to the page.
@@ -252,6 +260,7 @@ void onPortalParamsSaved() {
   }
   ui::radar::saveMilesFromPortal(s_param_miles.getValue());
   ui::radar::saveRunwaysFromPortal(s_param_runways.getValue());
+  ui::radar::saveAltitudeUnitsFromPortal(s_param_alt_meters.getValue());
 
   const char* ssid2 = s_param_backup_ssid.getValue();
   const char* pass2 = s_param_backup_pass.getValue();
@@ -285,6 +294,7 @@ void attachPortalParams(WiFiManager& wm) {
   wm.addParameter(&s_param_backup_lon);
   wm.addParameter(&s_param_display_header);
   wm.addParameter(&s_param_miles);
+  wm.addParameter(&s_param_alt_meters);
   wm.addParameter(&s_param_runways);
   wm.setSaveParamsCallback(onPortalParamsSaved);
 }
@@ -530,7 +540,8 @@ bool waitForLinkWithUi(const char* ssid_for_ui, unsigned long attempt_ms) {
   return wifiLinkUp();
 }
 
-bool tryConnectWithUi(const String& ssid, const String& pass, bool show_ui) {
+bool attemptConnect(const String& ssid, const String& pass, bool show_ui,
+                    bool restart_radio) {
   if (wifiLinkUp()) {
     return true;
   }
@@ -539,58 +550,52 @@ bool tryConnectWithUi(const String& ssid, const String& pass, bool show_ui) {
   if (show_ui) {
     statusScreenConnectingBegin(ui_ssid);
   }
-
-  for (uint8_t attempt = 1; attempt <= config::kWifiConnectAttempts; ++attempt) {
-    if (attempt > 1) {
-      Serial.printf("WiFi connect retry %u/%u\n", attempt,
-                    config::kWifiConnectAttempts);
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
-      delay(400);
-    }
-
-    startStaConnect(ssid, pass);
-
-    if (waitForLinkWithUi(ui_ssid, config::kWifiConnectAttemptMs)) {
-      return true;
-    }
+  if (restart_radio) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(400);
   }
 
-  return false;
+  startStaConnect(ssid, pass);
+  return waitForLinkWithUi(ui_ssid, config::kWifiConnectAttemptMs);
 }
 
-bool connectSavedNetwork(bool show_ui) {
-  String ssid;
-  String pass;
-  if (!primaryCredentials(ssid, pass)) {
-    Serial.println("No main WiFi stored");
-    return false;
-  }
-  Serial.printf("Trying main WiFi: %s\n", ssid.c_str());
-  return tryConnectWithUi(ssid, pass, show_ui);
-}
-
-bool connectBackupNetwork(bool show_ui) {
-  const String ssid = backupSsid();
-  if (ssid.length() == 0) {
-    return false;
-  }
-  Serial.printf("Main WiFi failed — trying backup: %s\n", ssid.c_str());
-  if (!tryConnectWithUi(ssid, backupPass(), show_ui)) {
-    return false;
-  }
-  s_on_backup_network = true;
-  services::location::useSecondary(true);
-  return true;
-}
-
+/** Alternates main and backup on every round instead of exhausting one first. */
 bool connectKnownNetworks(bool show_ui) {
-  if (connectSavedNetwork(show_ui)) {
-    s_on_backup_network = false;
-    services::location::useSecondary(false);
-    return true;
+  String main_ssid;
+  String main_pass;
+  const bool has_main = primaryCredentials(main_ssid, main_pass);
+  const String backup_ssid = backupSsid();
+  const String backup_pass = backupPass();
+  if (!has_main && backup_ssid.length() == 0) {
+    Serial.println("No WiFi credentials stored");
+    return false;
   }
-  return connectBackupNetwork(show_ui);
+
+  bool radio_used = false;
+  for (uint8_t round = 1; round <= config::kWifiConnectAttempts; ++round) {
+    if (has_main) {
+      Serial.printf("WiFi round %u/%u — main: %s\n", round,
+                    config::kWifiConnectAttempts, main_ssid.c_str());
+      if (attemptConnect(main_ssid, main_pass, show_ui, radio_used)) {
+        s_on_backup_network = false;
+        services::location::useSecondary(false);
+        return true;
+      }
+      radio_used = true;
+    }
+    if (backup_ssid.length() > 0) {
+      Serial.printf("WiFi round %u/%u — backup: %s\n", round,
+                    config::kWifiConnectAttempts, backup_ssid.c_str());
+      if (attemptConnect(backup_ssid, backup_pass, show_ui, radio_used)) {
+        s_on_backup_network = true;
+        services::location::useSecondary(true);
+        return true;
+      }
+      radio_used = true;
+    }
+  }
+  return false;
 }
 
 bool hasAnyCredentials() { return storedWifiCredentials() || backupSsid().length() > 0; }
