@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "config.h"
+#include "services/time_sync.h"
 #include "ui/radar_range.h"
 
 namespace services::adsb {
@@ -264,6 +265,12 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   if (err) {
     Serial.printf("adsb: JSON parse error: %s\n", err.c_str());
     return false;
+  }
+
+  // The snapshot carries the server time, which is the only clock this device has.
+  const double feed_now = doc["now"].as<double>();
+  if (feed_now > 0.0) {
+    services::timesync::setFromFeedTimestamp(feed_now);
   }
 
   JsonArray ac = doc["ac"].as<JsonArray>();

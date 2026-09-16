@@ -16,6 +16,8 @@
 
 #include "config.h"
 #include "services/radar_location.h"
+#include "services/time_sync.h"
+#include "ui/night_mode.h"
 #include "ui/radar_range.h"
 #include "ui/status_screens.h"
 
@@ -60,8 +62,8 @@ constexpr char kWifiPrefsNamespace[] = "wifi";
 constexpr char kPrefsForcePortalKey[] = "portal";
 constexpr char kPrefsPrimarySsidKey[] = "ssid1";
 constexpr char kPrefsPrimaryPassKey[] = "pass1";
-constexpr char kPrefsBackupSsidKey[] = "ssid2";
-constexpr char kPrefsBackupPassKey[] = "pass2";
+constexpr char kPrefsSecondarySsidKey[] = "ssid2";
+constexpr char kPrefsSecondaryPassKey[] = "pass2";
 
 bool s_force_config_portal = false;
 WiFiManager s_wm;
@@ -96,44 +98,105 @@ WiFiManagerParameter s_param_alt_meters("alt_meters", "Display altitude in meter
 
 constexpr int kSsidParamLen = 32;
 constexpr int kPassParamLen = 64;
-constexpr char kBackupSsidAttrs[] = " maxlength=\"32\"";
-constexpr char kBackupPassAttrs[] =
+constexpr char kSecondarySsidAttrs[] = " maxlength=\"32\"";
+constexpr char kSecondaryPassAttrs[] =
     " type=\"password\" maxlength=\"63\" placeholder=\"unchanged\"";
 
-WiFiManagerParameter s_param_backup_ssid("wifi2_ssid", "Backup WiFi SSID (optional)",
-                                         "", kSsidParamLen, kBackupSsidAttrs);
-WiFiManagerParameter s_param_backup_pass("wifi2_pass", "Backup WiFi password", "",
-                                         kPassParamLen, kBackupPassAttrs);
-WiFiManagerParameter s_param_backup_lat("radar_lat2", "Backup latitude (deg)", "",
-                                        kCoordParamLen, kCoordInputAttrs);
-WiFiManagerParameter s_param_backup_lon("radar_lon2", "Backup longitude (deg)", "",
-                                        kCoordParamLen, kCoordInputAttrs);
+WiFiManagerParameter s_param_secondary_ssid("wifi2_ssid", "SSID (optional)", "",
+                                            kSsidParamLen, kSecondarySsidAttrs);
+WiFiManagerParameter s_param_secondary_pass("wifi2_pass", "Password", "",
+                                            kPassParamLen, kSecondaryPassAttrs);
+WiFiManagerParameter s_param_secondary_lat("radar_lat2", "Latitude (deg)", "",
+                                           kCoordParamLen, kCoordInputAttrs);
+WiFiManagerParameter s_param_secondary_lon("radar_lon2", "Longitude (deg)", "",
+                                           kCoordParamLen, kCoordInputAttrs);
 
 // Hooks the scan-list click handler so picking a network asks which slot it goes to.
-constexpr char kBackupSectionHtml[] =
-    "<hr><h3>Backup network</h3>"
-    "<p>Used when the main network is unreachable.</p>"
+constexpr char kSecondarySectionHtml[] =
+    "<hr><h3>Secondary network</h3>"
+    "<p>Used when the primary network is unreachable.</p>"
     "<script>(function(){var o=window.c;window.c=function(l){"
     "var n=l.getAttribute('data-ssid')||l.innerText||l.textContent;"
     "var a=document.querySelector(\"input[name='wifi2_ssid']\");"
-    "if(a&&confirm('Use '+n+' as the BACKUP network?\\n\\nOK = backup   Cancel = main')){"
+    "if(a&&confirm('Use '+n+' as the SECONDARY network?\\n\\nOK = secondary   Cancel = primary')){"
     "a.value=n;var s=document.getElementById('s');if(s)s.value='';"
     "var p=document.getElementById('p');if(p){p.value='';p.disabled=true;}"
     "var b=document.querySelector(\"input[name='wifi2_pass']\");"
     "if(b){b.value='';b.focus();}return;}"
     "if(o)o(l);};})();</script>";
 constexpr char kDisplaySectionHtml[] = "<hr><h3>Display</h3>";
+constexpr char kNightSectionHtml[] =
+    "<hr><h3>Night mode</h3>"
+    "<p>Clock comes from the ADS-B feed; set the timezone below.</p>";
 
-WiFiManagerParameter s_param_backup_header(kBackupSectionHtml);
+constexpr int kTzParamLen = 48;
+constexpr int kTimeParamLen = 6;
+// The visible control is a <select>; this field only carries its value to the POST.
+constexpr char kTzAttrs[] = " type=\"hidden\"";
+constexpr char kTimeInputAttrs[] = " type=\"time\"";
+
+struct TimezoneOption {
+  const char* label;
+  const char* tz;
+};
+
+constexpr TimezoneOption kTimezones[] = {
+    {"Newfoundland (NST)", "NST3:30NDT,M3.2.0,M11.1.0"},
+    {"Atlantic (AST)", "AST4ADT,M3.2.0,M11.1.0"},
+    {"Eastern (EST)", "EST5EDT,M3.2.0,M11.1.0"},
+    {"Central (CST)", "CST6CDT,M3.2.0,M11.1.0"},
+    {"Mountain (MST)", "MST7MDT,M3.2.0,M11.1.0"},
+    {"Arizona (no DST)", "MST7"},
+    {"Pacific (PST)", "PST8PDT,M3.2.0,M11.1.0"},
+    {"Alaska (AKST)", "AKST9AKDT,M3.2.0,M11.1.0"},
+    {"Hawaii (HST)", "HST10"},
+    {"Saskatchewan (no DST)", "CST6"},
+    {"UK / Ireland (GMT)", "GMT0BST,M3.5.0/1,M10.5.0"},
+    {"Central Europe (CET)", "CET-1CEST,M3.5.0,M10.5.0/3"},
+    {"Eastern Europe (EET)", "EET-2EEST,M3.5.0/3,M10.5.0/4"},
+    {"UTC (no DST)", "UTC0"},
+};
+
+char s_tz_select_html[2048] = "";
+WiFiManagerParameter s_param_tz_select(s_tz_select_html);
+WiFiManagerParameter s_param_tz("tz", "", "", kTzParamLen, kTzAttrs, WFM_NO_LABEL);
+WiFiManagerParameter s_param_night_start("night_start", "Night starts", "",
+                                         kTimeParamLen, kTimeInputAttrs);
+WiFiManagerParameter s_param_night_end("night_end", "Night ends", "", kTimeParamLen,
+                                       kTimeInputAttrs);
+
+char s_night_dim_checkbox_attrs[32] = "type=\"checkbox\"";
+WiFiManagerParameter s_param_night_dim("night_dim", "Dim at night", "T",
+                                       2, s_night_dim_checkbox_attrs, WFM_LABEL_AFTER);
+
+char s_night_red_checkbox_attrs[32] = "type=\"checkbox\"";
+WiFiManagerParameter s_param_night_red("night_red", "Red matrix theme at night", "T", 2,
+                                       s_night_red_checkbox_attrs, WFM_LABEL_AFTER);
+
+WiFiManagerParameter s_param_night_header(kNightSectionHtml);
+
+// Ticking one night style clears the other; the firmware enforces it again on save.
+constexpr char kNightExclusiveHtml[] =
+    "<script>(function(){"
+    "var d=document.getElementById('night_dim'),"
+    "r=document.getElementById('night_red');"
+    "if(!d||!r)return;"
+    "d.addEventListener('change',function(){if(d.checked)r.checked=false;});"
+    "r.addEventListener('change',function(){if(r.checked)d.checked=false;});"
+    "})();</script>";
+
+WiFiManagerParameter s_param_night_footer(kNightExclusiveHtml);
+
+WiFiManagerParameter s_param_secondary_header(kSecondarySectionHtml);
 WiFiManagerParameter s_param_display_header(kDisplaySectionHtml);
 
-// WiFiManager fills the SSID placeholder with the AP it is connected to, which is
-// the backup one during a fallback; this rewrites it with the stored main SSID.
-char s_main_ssid_hint_html[384] = "";
-WiFiManagerParameter s_param_main_hint(s_main_ssid_hint_html);
+// Adds the "Primary network" heading WiFiManager has no slot for, and fixes the SSID
+// placeholder, which otherwise shows the AP in use (the secondary one on fallback).
+char s_primary_section_html[512] = "";
+WiFiManagerParameter s_param_primary_header(s_primary_section_html);
 
-/** True while the radar is connected through the backup network. */
-bool s_on_backup_network = false;
+/** True while the radar is connected through the secondary network. */
+bool s_on_secondary_network = false;
 
 String wifiPref(const char* key) {
   Preferences prefs;
@@ -178,16 +241,16 @@ void clearPrimaryCredentials() {
   clearCredentialPair(kPrefsPrimarySsidKey, kPrefsPrimaryPassKey);
 }
 
-String backupSsid() { return wifiPref(kPrefsBackupSsidKey); }
+String secondarySsid() { return wifiPref(kPrefsSecondarySsidKey); }
 
-String backupPass() { return wifiPref(kPrefsBackupPassKey); }
+String secondaryPass() { return wifiPref(kPrefsSecondaryPassKey); }
 
-void saveBackupCredentials(const String& ssid, const String& pass) {
-  saveCredentialPair(kPrefsBackupSsidKey, kPrefsBackupPassKey, ssid, pass);
+void saveSecondaryCredentials(const String& ssid, const String& pass) {
+  saveCredentialPair(kPrefsSecondarySsidKey, kPrefsSecondaryPassKey, ssid, pass);
 }
 
-void clearBackupCredentials() {
-  clearCredentialPair(kPrefsBackupSsidKey, kPrefsBackupPassKey);
+void clearSecondaryCredentials() {
+  clearCredentialPair(kPrefsSecondarySsidKey, kPrefsSecondaryPassKey);
 }
 
 String htmlEscape(const String& text) {
@@ -207,22 +270,57 @@ String htmlEscape(const String& text) {
   return out;
 }
 
-void refreshMainSsidHint() {
+void refreshPrimarySection() {
   const String ssid = primarySsid();
-  if (ssid.length() == 0) {
-    s_main_ssid_hint_html[0] = '\0';
-    return;
-  }
-  snprintf(s_main_ssid_hint_html, sizeof(s_main_ssid_hint_html),
+  snprintf(s_primary_section_html, sizeof(s_primary_section_html),
            "<span id=\"mainssid\" hidden>%s</span>"
-           "<script>(function(){var m=document.getElementById('mainssid'),"
-           "s=document.getElementById('s');"
-           "if(m&&s)s.placeholder=m.textContent;})();</script>",
+           "<script>(function(){var s=document.getElementById('s');if(!s)return;"
+           "var m=document.getElementById('mainssid');"
+           "if(m&&m.textContent)s.placeholder=m.textContent;"
+           "var lbl=document.querySelector(\"label[for='s']\")||s;"
+           "var h=document.createElement('h3');h.textContent='Primary network';"
+           "lbl.parentNode.insertBefore(h,lbl);})();</script>",
            htmlEscape(ssid).c_str());
 }
 
+void refreshTimezoneOptions() {
+  const String current(services::timesync::posixTz());
+  bool known = false;
+  for (const TimezoneOption& option : kTimezones) {
+    if (current == option.tz) {
+      known = true;
+      break;
+    }
+  }
+
+  String html;
+  html.reserve(sizeof(s_tz_select_html));
+  html += "<label for=\"tzsel\">Timezone</label><br/><select id=\"tzsel\" "
+          "onchange=\"document.getElementById('tz').value=this.value\">";
+  if (!known && current.length() > 0) {
+    const String escaped = htmlEscape(current);
+    html += "<option value=\"" + escaped + "\" selected>Saved (" + escaped + ")</option>";
+  }
+  for (const TimezoneOption& option : kTimezones) {
+    html += "<option value=\"";
+    html += option.tz;
+    html += "\"";
+    if (known && current == option.tz) {
+      html += " selected";
+    }
+    html += ">";
+    html += option.label;
+    html += "</option>";
+  }
+  html += "</select>";
+
+  strncpy(s_tz_select_html, html.c_str(), sizeof(s_tz_select_html) - 1);
+  s_tz_select_html[sizeof(s_tz_select_html) - 1] = '\0';
+}
+
 void refreshPortalParamDefaults() {
-  refreshMainSsidHint();
+  refreshPrimarySection();
+  refreshTimezoneOptions();
   char lat_buf[kCoordParamLen + 1];
   char lon_buf[kCoordParamLen + 1];
   snprintf(lat_buf, sizeof(lat_buf), "%.6f", services::location::primaryLat());
@@ -238,18 +336,30 @@ void refreshPortalParamDefaults() {
   snprintf(s_alt_meters_checkbox_attrs, sizeof(s_alt_meters_checkbox_attrs),
            "type=\"checkbox\"%s", ui::radar::altitudeMeters() ? " checked" : "");
   s_param_alt_meters.setValue("T", 2);
-  const String ssid2 = backupSsid();
-  s_param_backup_ssid.setValue(ssid2.c_str(), kSsidParamLen);
+  s_param_tz.setValue(services::timesync::posixTz(), kTzParamLen);
+  char time_buf[kTimeParamLen];
+  ui::radar::formatNightTime(time_buf, sizeof(time_buf), ui::radar::nightStartMinutes());
+  s_param_night_start.setValue(time_buf, kTimeParamLen);
+  ui::radar::formatNightTime(time_buf, sizeof(time_buf), ui::radar::nightEndMinutes());
+  s_param_night_end.setValue(time_buf, kTimeParamLen);
+  snprintf(s_night_dim_checkbox_attrs, sizeof(s_night_dim_checkbox_attrs),
+           "type=\"checkbox\"%s", ui::radar::nightDimEnabled() ? " checked" : "");
+  s_param_night_dim.setValue("T", 2);
+  snprintf(s_night_red_checkbox_attrs, sizeof(s_night_red_checkbox_attrs),
+           "type=\"checkbox\"%s", ui::radar::nightRedEnabled() ? " checked" : "");
+  s_param_night_red.setValue("T", 2);
+  const String ssid2 = secondarySsid();
+  s_param_secondary_ssid.setValue(ssid2.c_str(), kSsidParamLen);
   // Never echo the stored password back to the page.
-  s_param_backup_pass.setValue("", kPassParamLen);
+  s_param_secondary_pass.setValue("", kPassParamLen);
   if (services::location::hasSecondary()) {
     snprintf(lat_buf, sizeof(lat_buf), "%.6f", services::location::secondaryLat());
     snprintf(lon_buf, sizeof(lon_buf), "%.6f", services::location::secondaryLon());
-    s_param_backup_lat.setValue(lat_buf, kCoordParamLen);
-    s_param_backup_lon.setValue(lon_buf, kCoordParamLen);
+    s_param_secondary_lat.setValue(lat_buf, kCoordParamLen);
+    s_param_secondary_lon.setValue(lon_buf, kCoordParamLen);
   } else {
-    s_param_backup_lat.setValue("", kCoordParamLen);
-    s_param_backup_lon.setValue("", kCoordParamLen);
+    s_param_secondary_lat.setValue("", kCoordParamLen);
+    s_param_secondary_lon.setValue("", kCoordParamLen);
   }
 }
 
@@ -261,41 +371,53 @@ void onPortalParamsSaved() {
   ui::radar::saveMilesFromPortal(s_param_miles.getValue());
   ui::radar::saveRunwaysFromPortal(s_param_runways.getValue());
   ui::radar::saveAltitudeUnitsFromPortal(s_param_alt_meters.getValue());
+  services::timesync::saveTimezoneFromPortal(s_param_tz.getValue());
+  ui::radar::saveNightFromPortal(
+      s_param_night_start.getValue(), s_param_night_end.getValue(),
+      s_param_night_dim.getValue(), s_param_night_red.getValue());
 
-  const char* ssid2 = s_param_backup_ssid.getValue();
-  const char* pass2 = s_param_backup_pass.getValue();
+  const char* ssid2 = s_param_secondary_ssid.getValue();
+  const char* pass2 = s_param_secondary_pass.getValue();
   if (ssid2 == nullptr || ssid2[0] == '\0') {
-    clearBackupCredentials();
-    Serial.println("Backup WiFi cleared");
+    clearSecondaryCredentials();
+    Serial.println("Secondary WiFi cleared");
   } else {
     // An empty password field means "keep the stored one".
     const String pass = (pass2 != nullptr && pass2[0] != '\0') ? String(pass2)
-                                                              : backupPass();
-    saveBackupCredentials(String(ssid2), pass);
-    Serial.printf("Backup WiFi saved: %s\n", ssid2);
+                                                              : secondaryPass();
+    saveSecondaryCredentials(String(ssid2), pass);
+    Serial.printf("Secondary WiFi saved: %s\n", ssid2);
   }
 
-  if (!services::location::saveSecondaryFromStrings(s_param_backup_lat.getValue(),
-                                                    s_param_backup_lon.getValue())) {
-    Serial.println("Invalid backup lat/lon in portal — keeping previous location");
+  if (!services::location::saveSecondaryFromStrings(s_param_secondary_lat.getValue(),
+                                                    s_param_secondary_lon.getValue())) {
+    Serial.println("Invalid secondary lat/lon in portal — keeping previous location");
   }
-  services::location::useSecondary(s_on_backup_network);
+  services::location::useSecondary(s_on_secondary_network);
 }
 
 void attachPortalParams(WiFiManager& wm) {
   refreshPortalParamDefaults();
-  wm.addParameter(&s_param_main_hint);
+  wm.addParameter(&s_param_primary_header);
   wm.addParameter(&s_param_lat);
   wm.addParameter(&s_param_lon);
-  wm.addParameter(&s_param_backup_header);
-  wm.addParameter(&s_param_backup_ssid);
-  wm.addParameter(&s_param_backup_pass);
-  wm.addParameter(&s_param_backup_lat);
-  wm.addParameter(&s_param_backup_lon);
+  wm.addParameter(&s_param_secondary_header);
+  wm.addParameter(&s_param_secondary_ssid);
+  wm.addParameter(&s_param_secondary_pass);
+  wm.addParameter(&s_param_secondary_lat);
+  wm.addParameter(&s_param_secondary_lon);
   wm.addParameter(&s_param_display_header);
   wm.addParameter(&s_param_miles);
   wm.addParameter(&s_param_alt_meters);
   wm.addParameter(&s_param_runways);
+  wm.addParameter(&s_param_night_header);
+  wm.addParameter(&s_param_tz_select);
+  wm.addParameter(&s_param_tz);
+  wm.addParameter(&s_param_night_start);
+  wm.addParameter(&s_param_night_end);
+  wm.addParameter(&s_param_night_dim);
+  wm.addParameter(&s_param_night_red);
+  wm.addParameter(&s_param_night_footer);
   wm.setSaveParamsCallback(onPortalParamsSaved);
 }
 
@@ -366,13 +488,13 @@ bool readStaConfig(String& ssid, String& pass) {
 }
 
 bool primaryCredentials(String& ssid, String& pass) {
-  const String backup = backupSsid();
+  const String secondary = secondarySsid();
   ssid = primarySsid();
   pass = primaryPass();
   if (ssid.length() > 0) {
-    if (backup.length() > 0 && ssid == backup) {
-      // Older firmware copied the backup over the main slot; drop the bad entry.
-      Serial.println("Main WiFi slot held the backup SSID — cleared");
+    if (secondary.length() > 0 && ssid == secondary) {
+      // Older firmware copied the secondary over the primary slot; drop the bad entry.
+      Serial.println("Primary WiFi slot held the secondary SSID — cleared");
       clearPrimaryCredentials();
       ssid = String();
       pass = String();
@@ -381,14 +503,14 @@ bool primaryCredentials(String& ssid, String& pass) {
     return true;
   }
 
-  // Devices provisioned before the main slot existed: adopt the WiFi NVS copy,
-  // unless it is the backup network we are currently connected to.
-  if (s_on_backup_network || !readStaConfig(ssid, pass)) {
+  // Devices provisioned before the primary slot existed: adopt the WiFi NVS copy,
+  // unless it is the secondary network we are currently connected to.
+  if (s_on_secondary_network || !readStaConfig(ssid, pass)) {
     ssid = String();
     pass = String();
     return false;
   }
-  if (backup.length() > 0 && ssid == backup) {
+  if (secondary.length() > 0 && ssid == secondary) {
     ssid = String();
     pass = String();
     return false;
@@ -397,7 +519,7 @@ bool primaryCredentials(String& ssid, String& pass) {
   return true;
 }
 
-/** WiFiManager save callback: the portal just connected with new main credentials. */
+/** WiFiManager save callback: the portal just connected with new primary credentials. */
 void onPortalWifiSaved() {
   String ssid;
   String pass;
@@ -405,7 +527,7 @@ void onPortalWifiSaved() {
     return;
   }
   savePrimaryCredentials(ssid, pass);
-  Serial.printf("Main WiFi saved: %s\n", ssid.c_str());
+  Serial.printf("Primary WiFi saved: %s\n", ssid.c_str());
 }
 
 bool storedWifiCredentials() {
@@ -435,9 +557,11 @@ void eraseWifiCredentials() {
 void resetWifiCredentials() {
   markForceConfigPortal();
   eraseWifiCredentials();
-  clearBackupCredentials();
+  clearSecondaryCredentials();
   services::location::clear();
   ui::radar::unitsReset();
+  ui::radar::nightReset();
+  services::timesync::reset();
   Serial.println("WiFi credentials, location, and units cleared");
 }
 
@@ -560,14 +684,14 @@ bool attemptConnect(const String& ssid, const String& pass, bool show_ui,
   return waitForLinkWithUi(ui_ssid, config::kWifiConnectAttemptMs);
 }
 
-/** Alternates main and backup on every round instead of exhausting one first. */
+/** Alternates primary and secondary on every round instead of exhausting one first. */
 bool connectKnownNetworks(bool show_ui) {
   String main_ssid;
   String main_pass;
   const bool has_main = primaryCredentials(main_ssid, main_pass);
-  const String backup_ssid = backupSsid();
-  const String backup_pass = backupPass();
-  if (!has_main && backup_ssid.length() == 0) {
+  const String secondary_ssid = secondarySsid();
+  const String secondary_pass = secondaryPass();
+  if (!has_main && secondary_ssid.length() == 0) {
     Serial.println("No WiFi credentials stored");
     return false;
   }
@@ -575,20 +699,20 @@ bool connectKnownNetworks(bool show_ui) {
   bool radio_used = false;
   for (uint8_t round = 1; round <= config::kWifiConnectAttempts; ++round) {
     if (has_main) {
-      Serial.printf("WiFi round %u/%u — main: %s\n", round,
+      Serial.printf("WiFi round %u/%u — primary: %s\n", round,
                     config::kWifiConnectAttempts, main_ssid.c_str());
       if (attemptConnect(main_ssid, main_pass, show_ui, radio_used)) {
-        s_on_backup_network = false;
+        s_on_secondary_network = false;
         services::location::useSecondary(false);
         return true;
       }
       radio_used = true;
     }
-    if (backup_ssid.length() > 0) {
-      Serial.printf("WiFi round %u/%u — backup: %s\n", round,
-                    config::kWifiConnectAttempts, backup_ssid.c_str());
-      if (attemptConnect(backup_ssid, backup_pass, show_ui, radio_used)) {
-        s_on_backup_network = true;
+    if (secondary_ssid.length() > 0) {
+      Serial.printf("WiFi round %u/%u — secondary: %s\n", round,
+                    config::kWifiConnectAttempts, secondary_ssid.c_str());
+      if (attemptConnect(secondary_ssid, secondary_pass, show_ui, radio_used)) {
+        s_on_secondary_network = true;
         services::location::useSecondary(true);
         return true;
       }
@@ -598,7 +722,9 @@ bool connectKnownNetworks(bool show_ui) {
   return false;
 }
 
-bool hasAnyCredentials() { return storedWifiCredentials() || backupSsid().length() > 0; }
+bool hasAnyCredentials() {
+  return storedWifiCredentials() || secondarySsid().length() > 0;
+}
 
 bool openConfigPortal() {
   stopLanWebPortal();
@@ -611,7 +737,7 @@ bool openConfigPortal() {
   while (s_wm.getConfigPortalActive()) {
     bootButtonPollLongPress();
     if (s_wm.process()) {
-      s_on_backup_network = false;
+      s_on_secondary_network = false;
       services::location::useSecondary(false);
       return true;
     }

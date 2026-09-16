@@ -5,7 +5,7 @@ namespace services::location {
 /** Load saved lat/lon from NVS, or use config defaults. Call once before WiFi setup. */
 void init();
 
-/** Active center: secondary while the backup network is in use, primary otherwise. */
+/** Active center: secondary while the secondary network is in use, primary otherwise. */
 double lat();
 double lon();
 
@@ -16,7 +16,7 @@ double primaryLon();
 /** Parse portal strings, validate, persist to NVS, update runtime values. */
 bool saveFromStrings(const char* lat_str, const char* lon_str);
 
-/** Secondary center, used while the backup WiFi network is connected. */
+/** Secondary center, used while the Secondary network is connected. */
 bool hasSecondary();
 double secondaryLat();
 double secondaryLon();

@@ -9,17 +9,23 @@
 #include "hardware/display.h"
 #include "services/adsb_client.h"
 #include "services/radar_location.h"
+#include "services/time_sync.h"
 #include "services/wifi_setup.h"
+#include "ui/night_mode.h"
 #include "ui/radar_display.h"
 #include "ui/radar_range.h"
 #include "ui/status_screens.h"
 
 namespace {
 
+/** Night mode flips on a minute boundary; no need to poll it every loop. */
+constexpr unsigned long kNightCheckIntervalMs = 1000;
+
 bool g_radar_visible = false;
 unsigned long g_wifi_down_since = 0;
 unsigned long g_last_reconnect_ms = 0;
 unsigned long g_last_adsb_fetch_ms = 0;
+unsigned long g_last_night_check_ms = 0;
 
 void showRadarIfConnected() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -76,6 +82,8 @@ void setup() {
   }
   services::location::init();
   ui::radar::rangeInit();
+  services::timesync::init();
+  ui::radar::nightInit();
   services::adsb::setPollFn(wifiLoop);
 
   if (wifiSetupConnect()) {
@@ -86,6 +94,13 @@ void setup() {
 void loop() {
   handleBootButton();
   wifiLoop();
+
+  if (millis() - g_last_night_check_ms >= kNightCheckIntervalMs) {
+    g_last_night_check_ms = millis();
+    if (g_radar_visible && ui::radarDisplayNightStyleChanged()) {
+      ui::radarDisplayDraw();
+    }
+  }
 
   if (WiFi.status() != WL_CONNECTED) {
     if (g_radar_visible) {

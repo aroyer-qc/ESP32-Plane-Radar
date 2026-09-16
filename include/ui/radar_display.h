@@ -11,4 +11,7 @@ void radarDisplayDraw();
 /** Redraw aircraft only (blits cached grid; no full-screen clear). */
 void radarDisplayRefreshAircraft();
 
+/** True when the night schedule moved to another palette since the last draw. */
+bool radarDisplayNightStyleChanged();
+
 }  // namespace ui

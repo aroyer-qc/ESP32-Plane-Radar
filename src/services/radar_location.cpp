@@ -129,7 +129,7 @@ void useSecondary(bool enabled) {
   }
   s_use_secondary = enabled;
   Serial.printf("Radar center: %s (%.6f, %.6f)\n",
-                (enabled && s_has_secondary) ? "backup" : "primary", lat(), lon());
+                (enabled && s_has_secondary) ? "secondary" : "primary", lat(), lon());
 }
 
 bool saveSecondaryFromStrings(const char* lat_str, const char* lon_str) {
@@ -146,7 +146,7 @@ bool saveSecondaryFromStrings(const char* lat_str, const char* lon_str) {
     return false;
   }
   persistSecondary(lat, lon);
-  Serial.printf("Backup radar location saved: %.6f, %.6f\n", lat, lon);
+  Serial.printf("Secondary radar location saved: %.6f, %.6f\n", lat, lon);
   return true;
 }
 

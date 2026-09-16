@@ -13,9 +13,9 @@ constexpr char kPortalIp[] = "192.168.4.1";
 constexpr char kPortalHostname[] = "plane-radar";
 constexpr char kPortalHostUrl[] = "plane-radar.local";
 
-/** Per-attempt STA connect wait (ms); main and backup alternate each round. */
+/** Per-attempt STA connect wait (ms); Primary and Secondary alternate each round. */
 constexpr unsigned long kWifiConnectAttemptMs = 10000;
-/** Rounds over the known networks (main, then backup) before giving up. */
+/** Rounds over the known networks (Primary, then Secondary) before giving up. */
 constexpr uint8_t kWifiConnectAttempts = 3;
 constexpr unsigned long kWifiPortalTimeoutSec = 0;  // 0 = no timeout while configuring
 constexpr unsigned long kWifiConnectingFrameMs = 50;

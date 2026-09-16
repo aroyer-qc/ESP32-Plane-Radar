@@ -57,6 +57,8 @@ void saveAltMeters() {
   s_prefs.end();
 }
 
+}  // namespace
+
 bool portalCheckboxChecked(const char* value) {
   if (value == nullptr || value[0] == '\0') {
     return false;
@@ -68,8 +70,6 @@ bool portalCheckboxChecked(const char* value) {
   }
   return strcmp(value, "on") == 0;
 }
-
-}  // namespace
 
 void rangeInit() {
   if (!s_prefs.begin(kPrefsNamespace, true)) {

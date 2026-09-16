@@ -12,6 +12,7 @@
 #include "hardware/display_font.h"
 #include "services/adsb_client.h"
 #include "services/radar_location.h"
+#include "ui/night_mode.h"
 #include "ui/radar_range.h"
 #include "ui/radar_theme.h"
 #include "ui/runway_overlay.h"
@@ -25,6 +26,7 @@ uint16_t kColorLabel = 0xFFFF;
 uint16_t kColorCenter = 0xFFFF;
 uint16_t kColorAircraft = 0x001F;
 uint16_t kColorTrackVector = 0xFFFF;
+uint16_t kColorTagCallsign = 0xFFFF;
 uint16_t kColorTagType = 0x5DFF;
 uint16_t kColorTagAltitude = 0xFFE0;
 uint16_t kColorRunway = 0x4D5F;
@@ -411,29 +413,91 @@ void initTagLabelMetrics() {
   s_tag_label_metrics_ready = true;
 }
 
+struct NightRgb {
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+};
+
+/** Red matrix ramp: grid darkest, symbol/tags mid, speed vector palest. */
+constexpr NightRgb kNightBackground{0, 0, 0};
+constexpr NightRgb kNightGrid{72, 0, 0};
+constexpr NightRgb kNightLabel{120, 10, 10};
+constexpr NightRgb kNightCenter{150, 22, 22};
+constexpr NightRgb kNightAircraft{195, 40, 40};
+constexpr NightRgb kNightTrack{255, 112, 112};
+constexpr NightRgb kNightRunway{60, 0, 0};
+constexpr NightRgb kNightRunwayLabel{104, 8, 8};
+constexpr uint8_t kNightDimPercent = 40;
+
+radar::NightStyle s_night_style = radar::NightStyle::kNone;
+bool s_palette_changed = false;
+
+uint8_t scaleChannel(uint8_t value, uint8_t percent) {
+  return static_cast<uint8_t>((static_cast<uint16_t>(value) * percent) / 100);
+}
+
+uint16_t dayColor(uint8_t r, uint8_t g, uint8_t b, uint8_t percent) {
+  return tft.color565(scaleChannel(r, percent), scaleChannel(g, percent),
+                      scaleChannel(b, percent));
+}
+
+/** Night tones are authored in true RGB, so undo the panel's BGR order here. */
+uint16_t nightColor(const NightRgb& c, uint8_t percent) {
+  const uint8_t r = scaleChannel(c.r, percent);
+  const uint8_t g = scaleChannel(c.g, percent);
+  const uint8_t b = scaleChannel(c.b, percent);
+  return config::kDisplayRgbOrder ? tft.color565(b, g, r) : tft.color565(r, g, b);
+}
+
 void initPalette() {
-  radar::kColorBackground = tft.color565(radar::kBgR, radar::kBgG, radar::kBgB);
-  radar::kColorGrid = tft.color565(radar::kGridR, radar::kGridG, radar::kGridB);
-  radar::kColorLabel = tft.color565(255, 255, 255);
-  radar::kColorCenter = tft.color565(255, 255, 255);
+  const radar::NightStyle style = radar::nightStyle();
+  if (style != s_night_style) {
+    s_night_style = style;
+    s_palette_changed = true;
+  }
+  const uint8_t pct =
+      (style == radar::NightStyle::kDim) ? kNightDimPercent : 100;
+
+  if (style == radar::NightStyle::kRed) {
+    radar::kColorBackground = nightColor(kNightBackground, pct);
+    radar::kColorGrid = nightColor(kNightGrid, pct);
+    radar::kColorLabel = nightColor(kNightLabel, pct);
+    radar::kColorCenter = nightColor(kNightCenter, pct);
+    // Symbol and its tag text share one tone; the speed vector is the palest.
+    radar::kColorAircraft = nightColor(kNightAircraft, pct);
+    radar::kColorTagCallsign = nightColor(kNightAircraft, pct);
+    radar::kColorTagType = nightColor(kNightAircraft, pct);
+    radar::kColorTagAltitude = nightColor(kNightAircraft, pct);
+    radar::kColorTrackVector = nightColor(kNightTrack, pct);
+    radar::kColorRunway = nightColor(kNightRunway, pct);
+    radar::kColorRunwayLabel = nightColor(kNightRunwayLabel, pct);
+    return;
+  }
+
+  radar::kColorBackground = dayColor(radar::kBgR, radar::kBgG, radar::kBgB, pct);
+  radar::kColorGrid = dayColor(radar::kGridR, radar::kGridG, radar::kGridB, pct);
+  radar::kColorLabel = dayColor(255, 255, 255, pct);
+  radar::kColorCenter = dayColor(255, 255, 255, pct);
   // GC9A01 BGR panel: swap R/B in color565 so logical red renders red on screen.
   if (config::kDisplayRgbOrder) {
     radar::kColorAircraft =
-        tft.color565(radar::kAircraftB, radar::kAircraftG, radar::kAircraftR);
+        dayColor(radar::kAircraftB, radar::kAircraftG, radar::kAircraftR, pct);
   } else {
     radar::kColorAircraft =
-        tft.color565(radar::kAircraftR, radar::kAircraftG, radar::kAircraftB);
+        dayColor(radar::kAircraftR, radar::kAircraftG, radar::kAircraftB, pct);
   }
   radar::kColorTrackVector =
-      tft.color565(radar::kTrackR, radar::kTrackG, radar::kTrackB);
+      dayColor(radar::kTrackR, radar::kTrackG, radar::kTrackB, pct);
+  radar::kColorTagCallsign = dayColor(255, 255, 255, pct);
   radar::kColorTagType =
-      tft.color565(radar::kTagTypeR, radar::kTagTypeG, radar::kTagTypeB);
+      dayColor(radar::kTagTypeR, radar::kTagTypeG, radar::kTagTypeB, pct);
   radar::kColorTagAltitude =
-      tft.color565(radar::kTagAltR, radar::kTagAltG, radar::kTagAltB);
+      dayColor(radar::kTagAltR, radar::kTagAltG, radar::kTagAltB, pct);
   radar::kColorRunway =
-      tft.color565(radar::kRunwayR, radar::kRunwayG, radar::kRunwayB);
-  radar::kColorRunwayLabel = tft.color565(radar::kRunwayLabelR, radar::kRunwayLabelG,
-                                          radar::kRunwayLabelB);
+      dayColor(radar::kRunwayR, radar::kRunwayG, radar::kRunwayB, pct);
+  radar::kColorRunwayLabel = dayColor(radar::kRunwayLabelR, radar::kRunwayLabelG,
+                                      radar::kRunwayLabelB, pct);
 }
 
 constexpr float kKmPerDeg = 111.0f;
@@ -930,7 +994,7 @@ void drawAircraftTag(const TagPlacement& placement,
   int ly = placement.box.t;
 
   if (plane.callsign[0] != '\0') {
-    s_draw->setTextColor(radar::kColorLabel, radar::kColorBackground);
+    s_draw->setTextColor(radar::kColorTagCallsign, radar::kColorBackground);
     s_draw->drawString(plane.callsign, anchor_x, ly);
   }
   ly += line_h;
@@ -1230,7 +1294,8 @@ void renderFrame(bool force_full) {
   }
   s_dirty_sink = nullptr;
 
-  if (force_full || !s_panel_matches_frame) {
+  if (force_full || !s_panel_matches_frame || s_palette_changed) {
+    s_palette_changed = false;
     s_frame.pushSprite(0, 0);
   } else {
     DirtyRegion update = s_dirty_previous;
@@ -1280,6 +1345,10 @@ void radarDisplayRefreshAircraft() {
   }
 
   radarDisplayDraw();
+}
+
+bool radarDisplayNightStyleChanged() {
+  return radar::nightStyle() != s_night_style;
 }
 
 }  // namespace ui

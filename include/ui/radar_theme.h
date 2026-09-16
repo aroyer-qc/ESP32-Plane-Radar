@@ -95,6 +95,7 @@ extern uint16_t kColorLabel;
 extern uint16_t kColorCenter;
 extern uint16_t kColorAircraft;
 extern uint16_t kColorTrackVector;
+extern uint16_t kColorTagCallsign;
 extern uint16_t kColorTagType;
 extern uint16_t kColorTagAltitude;
 extern uint16_t kColorRunway;

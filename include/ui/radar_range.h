@@ -51,6 +51,8 @@ bool altitudeMeters();
 void saveMilesFromPortal(const char* checkbox_value);
 void saveRunwaysFromPortal(const char* checkbox_value);
 void saveAltitudeUnitsFromPortal(const char* checkbox_value);
+/** True when a WiFiManager checkbox came back ticked. */
+bool portalCheckboxChecked(const char* value);
 void formatRing3Label(char* buf, size_t len, float ring3_km, bool use_miles);
 void formatCurrentRing3Label(char* buf, size_t len);
 /** Reset distance units to km (e.g. with WiFi credential wipe). */
