@@ -785,33 +785,6 @@ constexpr int kTagRingStepPx = 12;
 constexpr uint16_t kTagCandidateCount = kTagAngleSteps * kTagRingCount;
 constexpr uint16_t kNoTagCandidate = 0xFFFF;
 
-/** Boxes of the fixed UI text (cardinals, range scale) for tags to route around. */
-class StaticTextBoxes {
- public:
-  void clear() { count_ = 0; }
-  size_t count() const { return count_; }
-  const TagBox& at(size_t i) const { return boxes_[i]; }
-
-  void add(int l, int t, int r, int b) {
-    if (count_ >= kMaxBoxes) {
-      return;
-    }
-    boxes_[count_].l = static_cast<int16_t>(l);
-    boxes_[count_].t = static_cast<int16_t>(t);
-    boxes_[count_].r = static_cast<int16_t>(r);
-    boxes_[count_].b = static_cast<int16_t>(b);
-    ++count_;
-  }
-
- private:
-  static constexpr size_t kMaxBoxes = 8;
-
-  TagBox boxes_[kMaxBoxes];
-  size_t count_ = 0;
-};
-
-StaticTextBoxes s_static_text;
-
 /** Keeps each aircraft's chosen anchor across polls so tags stop flipping. */
 class TagPlacementMemory {
  public:
@@ -878,9 +851,6 @@ class TagLayout {
  public:
   void beginPass() {
     count_ = 0;
-    for (size_t i = 0; i < s_static_text.count(); ++i) {
-      reserveBox(s_static_text.at(i));
-    }
     memory_.beginPass();
   }
 
@@ -917,8 +887,7 @@ class TagLayout {
   }
 
  private:
-  // Aircraft tags plus the handful of static UI labels.
-  static constexpr size_t kMaxBoxes = services::adsb::kMaxAircraft + 8;
+  static constexpr size_t kMaxBoxes = services::adsb::kMaxAircraft;
   static constexpr int kScreenMarginPx = 1;
 
   /** Heading of the blip-to-center direction; tags start out pointing inward. */
@@ -1188,21 +1157,6 @@ void drawCardinalLabel(const char* text, int x, int y, textdatum_t datum) {
   s_draw->setTextDatum(datum);
   s_draw->setTextColor(radar::kColorLabel, radar::kColorBackground);
   s_draw->drawString(text, x, y);
-
-  const int tw = s_draw->textWidth(text);
-  const int th = s_draw->fontHeight();
-  int left = x - tw / 2;
-  int top = y - th / 2;
-  if (datum == textdatum_t::middle_left) {
-    left = x;
-  } else if (datum == textdatum_t::middle_right) {
-    left = x - tw;
-  } else if (datum == textdatum_t::top_center) {
-    top = y;
-  } else if (datum == textdatum_t::bottom_center) {
-    top = y - th;
-  }
-  s_static_text.add(left, top, left + tw, top + th);
 }
 
 void drawScaleLabelWithBackground(const char* text, int x, int y) {
@@ -1221,8 +1175,6 @@ void drawScaleLabelWithBackground(const char* text, int x, int y) {
                    radar::kColorBackground);
   s_draw->setTextColor(radar::kColorGrid, radar::kColorBackground);
   s_draw->drawString(text, x, y);
-
-  s_static_text.add(left, top, left + tw + kPadX * 2, top + th + kPadY * 2);
 }
 
 void drawGridRing(int cx, int cy, int r, uint16_t color) {
@@ -1329,7 +1281,6 @@ void drawScaleLabel(int cx, int cy, int outer_radius) {
 template <typename Gfx>
 void drawStaticGrid(Gfx& gfx) {
   initLabelMetrics();
-  s_static_text.clear();
   const DrawScope scope(gfx);
   displayFontEnsureLoaded(gfx);
   const int cx = radar::kCenterX;
