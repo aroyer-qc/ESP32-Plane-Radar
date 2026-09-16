@@ -1,7 +1,6 @@
 # Plane Radar
 
-<img width="800" height="450" alt="plane-radar" src="input.webm" />
-<!-- https://github.com/user-attachments/assets/716d0992-dab8-47ba-8f1a-2aec7f607419" -->
+<img width="800" alt="plane-radar" src="input.gif" />
 
 **3D printed case (STL + assembly):** [MakerWorld](https://makerworld.com/en/models/2872376-esp32-plane-radar-live-ads-b-on-a-round-display#profileId-3207083) · **Firmware:** [Releases](https://github.com/MatixYo/ESP32-Plane-Radar/releases)
 
