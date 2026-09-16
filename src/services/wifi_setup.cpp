@@ -58,6 +58,8 @@ namespace {
 /** Separate from planeradar prefs (rangeInit) to avoid NVS handle conflicts. */
 constexpr char kWifiPrefsNamespace[] = "wifi";
 constexpr char kPrefsForcePortalKey[] = "portal";
+constexpr char kPrefsPrimarySsidKey[] = "ssid1";
+constexpr char kPrefsPrimaryPassKey[] = "pass1";
 constexpr char kPrefsBackupSsidKey[] = "ssid2";
 constexpr char kPrefsBackupPassKey[] = "pass2";
 
@@ -120,50 +122,102 @@ constexpr char kDisplaySectionHtml[] = "<hr><h3>Display</h3>";
 WiFiManagerParameter s_param_backup_header(kBackupSectionHtml);
 WiFiManagerParameter s_param_display_header(kDisplaySectionHtml);
 
+// WiFiManager fills the SSID placeholder with the AP it is connected to, which is
+// the backup one during a fallback; this rewrites it with the stored main SSID.
+char s_main_ssid_hint_html[384] = "";
+WiFiManagerParameter s_param_main_hint(s_main_ssid_hint_html);
+
 /** True while the radar is connected through the backup network. */
 bool s_on_backup_network = false;
 
-String backupSsid() {
+String wifiPref(const char* key) {
   Preferences prefs;
   if (!prefs.begin(kWifiPrefsNamespace, true)) {
     return String();
   }
-  const String ssid = prefs.getString(kPrefsBackupSsidKey, "");
+  const String value = prefs.getString(key, "");
   prefs.end();
-  return ssid;
+  return value;
 }
 
-String backupPass() {
-  Preferences prefs;
-  if (!prefs.begin(kWifiPrefsNamespace, true)) {
-    return String();
-  }
-  const String pass = prefs.getString(kPrefsBackupPassKey, "");
-  prefs.end();
-  return pass;
-}
-
-void saveBackupCredentials(const String& ssid, const String& pass) {
+void saveCredentialPair(const char* ssid_key, const char* pass_key, const String& ssid,
+                        const String& pass) {
   Preferences prefs;
   if (!prefs.begin(kWifiPrefsNamespace, false)) {
     return;
   }
-  prefs.putString(kPrefsBackupSsidKey, ssid);
-  prefs.putString(kPrefsBackupPassKey, pass);
+  prefs.putString(ssid_key, ssid);
+  prefs.putString(pass_key, pass);
   prefs.end();
+}
+
+void clearCredentialPair(const char* ssid_key, const char* pass_key) {
+  Preferences prefs;
+  if (!prefs.begin(kWifiPrefsNamespace, false)) {
+    return;
+  }
+  prefs.remove(ssid_key);
+  prefs.remove(pass_key);
+  prefs.end();
+}
+
+String primarySsid() { return wifiPref(kPrefsPrimarySsidKey); }
+
+String primaryPass() { return wifiPref(kPrefsPrimaryPassKey); }
+
+void savePrimaryCredentials(const String& ssid, const String& pass) {
+  saveCredentialPair(kPrefsPrimarySsidKey, kPrefsPrimaryPassKey, ssid, pass);
+}
+
+void clearPrimaryCredentials() {
+  clearCredentialPair(kPrefsPrimarySsidKey, kPrefsPrimaryPassKey);
+}
+
+String backupSsid() { return wifiPref(kPrefsBackupSsidKey); }
+
+String backupPass() { return wifiPref(kPrefsBackupPassKey); }
+
+void saveBackupCredentials(const String& ssid, const String& pass) {
+  saveCredentialPair(kPrefsBackupSsidKey, kPrefsBackupPassKey, ssid, pass);
 }
 
 void clearBackupCredentials() {
-  Preferences prefs;
-  if (!prefs.begin(kWifiPrefsNamespace, false)) {
+  clearCredentialPair(kPrefsBackupSsidKey, kPrefsBackupPassKey);
+}
+
+String htmlEscape(const String& text) {
+  String out;
+  out.reserve(text.length() + 8);
+  for (unsigned int i = 0; i < text.length(); ++i) {
+    const char c = text.charAt(i);
+    switch (c) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      case '\'': out += "&#39;"; break;
+      default: out += c; break;
+    }
+  }
+  return out;
+}
+
+void refreshMainSsidHint() {
+  const String ssid = primarySsid();
+  if (ssid.length() == 0) {
+    s_main_ssid_hint_html[0] = '\0';
     return;
   }
-  prefs.remove(kPrefsBackupSsidKey);
-  prefs.remove(kPrefsBackupPassKey);
-  prefs.end();
+  snprintf(s_main_ssid_hint_html, sizeof(s_main_ssid_hint_html),
+           "<span id=\"mainssid\" hidden>%s</span>"
+           "<script>(function(){var m=document.getElementById('mainssid'),"
+           "s=document.getElementById('s');"
+           "if(m&&s)s.placeholder=m.textContent;})();</script>",
+           htmlEscape(ssid).c_str());
 }
 
 void refreshPortalParamDefaults() {
+  refreshMainSsidHint();
   char lat_buf[kCoordParamLen + 1];
   char lon_buf[kCoordParamLen + 1];
   snprintf(lat_buf, sizeof(lat_buf), "%.6f", services::location::primaryLat());
@@ -221,6 +275,7 @@ void onPortalParamsSaved() {
 
 void attachPortalParams(WiFiManager& wm) {
   refreshPortalParamDefaults();
+  wm.addParameter(&s_param_main_hint);
   wm.addParameter(&s_param_lat);
   wm.addParameter(&s_param_lon);
   wm.addParameter(&s_param_backup_header);
@@ -272,7 +327,8 @@ bool consumeForceConfigPortal() {
   return true;
 }
 
-bool storedWifiCredentials() {
+/** Reads the SSID/password currently held by the WiFi driver. */
+bool readStaConfig(String& ssid, String& pass) {
   wifi_mode_t mode = WIFI_MODE_NULL;
   if (esp_wifi_get_mode(&mode) != ESP_OK || mode == WIFI_MODE_NULL) {
     WiFi.mode(WIFI_STA);
@@ -283,10 +339,73 @@ bool storedWifiCredentials() {
   if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) {
     return false;
   }
-  return conf.sta.ssid[0] != '\0';
+  if (conf.sta.ssid[0] == '\0') {
+    return false;
+  }
+
+  // ESP-IDF stores the SSID in a fixed 32-byte field. A maximum-length
+  // SSID has no room for a trailing NUL, so copy it to a larger buffer
+  // and explicitly terminate it before constructing an Arduino String.
+  char ssid_buf[sizeof(conf.sta.ssid) + 1] = {};
+  memcpy(ssid_buf, conf.sta.ssid, sizeof(conf.sta.ssid));
+  char pass_buf[sizeof(conf.sta.password) + 1] = {};
+  memcpy(pass_buf, conf.sta.password, sizeof(conf.sta.password));
+  ssid = ssid_buf;
+  pass = pass_buf;
+  return true;
+}
+
+bool primaryCredentials(String& ssid, String& pass) {
+  const String backup = backupSsid();
+  ssid = primarySsid();
+  pass = primaryPass();
+  if (ssid.length() > 0) {
+    if (backup.length() > 0 && ssid == backup) {
+      // Older firmware copied the backup over the main slot; drop the bad entry.
+      Serial.println("Main WiFi slot held the backup SSID — cleared");
+      clearPrimaryCredentials();
+      ssid = String();
+      pass = String();
+      return false;
+    }
+    return true;
+  }
+
+  // Devices provisioned before the main slot existed: adopt the WiFi NVS copy,
+  // unless it is the backup network we are currently connected to.
+  if (s_on_backup_network || !readStaConfig(ssid, pass)) {
+    ssid = String();
+    pass = String();
+    return false;
+  }
+  if (backup.length() > 0 && ssid == backup) {
+    ssid = String();
+    pass = String();
+    return false;
+  }
+  savePrimaryCredentials(ssid, pass);
+  return true;
+}
+
+/** WiFiManager save callback: the portal just connected with new main credentials. */
+void onPortalWifiSaved() {
+  String ssid;
+  String pass;
+  if (!readStaConfig(ssid, pass)) {
+    return;
+  }
+  savePrimaryCredentials(ssid, pass);
+  Serial.printf("Main WiFi saved: %s\n", ssid.c_str());
+}
+
+bool storedWifiCredentials() {
+  String ssid;
+  String pass;
+  return primaryCredentials(ssid, pass);
 }
 
 void eraseWifiCredentials() {
+  clearPrimaryCredentials();
   stopLanWebPortal();
   WiFi.setAutoReconnect(false);
   WiFi.mode(WIFI_OFF);
@@ -342,6 +461,7 @@ void ensureWifiManager() {
                            IPAddress(255, 255, 255, 0));
   s_wm.setHostname(config::kPortalHostname);
   s_wm.setAPCallback(onConfigPortalApStarted);
+  s_wm.setSaveConfigCallback(onPortalWifiSaved);
   attachPortalParams(s_wm);
   s_wm_configured = true;
 }
@@ -382,14 +502,18 @@ void prepareSta() {
   WiFi.setAutoReconnect(true);
 }
 
-void startStaConnect(const String& ssid, const String& pass, bool persist_credentials) {
+void startStaConnect(const String& ssid, const String& pass) {
   prepareSta();
-  WiFi.persistent(persist_credentials);
+  // Connection attempts must never rewrite the stored slots: WiFi.persistent()
+  // only takes effect on the very first radio init, so force RAM storage.
+  WiFi.persistent(false);
+  esp_wifi_set_storage(WIFI_STORAGE_RAM);
   if (ssid.length() > 0) {
     WiFi.begin(ssid.c_str(), pass.c_str());
   } else {
     WiFi.begin();
   }
+  esp_wifi_set_storage(WIFI_STORAGE_FLASH);
   WiFi.persistent(true);
 }
 
@@ -406,8 +530,7 @@ bool waitForLinkWithUi(const char* ssid_for_ui, unsigned long attempt_ms) {
   return wifiLinkUp();
 }
 
-bool tryConnectWithUi(const String& ssid, const String& pass, bool show_ui,
-                      bool persist_credentials) {
+bool tryConnectWithUi(const String& ssid, const String& pass, bool show_ui) {
   if (wifiLinkUp()) {
     return true;
   }
@@ -426,7 +549,7 @@ bool tryConnectWithUi(const String& ssid, const String& pass, bool show_ui,
       delay(400);
     }
 
-    startStaConnect(ssid, pass, persist_credentials);
+    startStaConnect(ssid, pass);
 
     if (waitForLinkWithUi(ui_ssid, config::kWifiConnectAttemptMs)) {
       return true;
@@ -437,36 +560,14 @@ bool tryConnectWithUi(const String& ssid, const String& pass, bool show_ui,
 }
 
 bool connectSavedNetwork(bool show_ui) {
-  wifi_mode_t mode = WIFI_MODE_NULL;
-  if (esp_wifi_get_mode(&mode) != ESP_OK || mode == WIFI_MODE_NULL) {
-    WiFi.mode(WIFI_STA);
-    delay(50);
-  }
-
-  wifi_config_t conf = {};
-  if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) {
+  String ssid;
+  String pass;
+  if (!primaryCredentials(ssid, pass)) {
+    Serial.println("No main WiFi stored");
     return false;
   }
-
-  if (conf.sta.ssid[0] == '\0') {
-    return false;
-  }
-
-  // ESP-IDF stores the SSID in a fixed 32-byte field. A maximum-length
-  // SSID has no room for a trailing NUL, so copy it to a larger buffer
-  // and explicitly terminate it before constructing an Arduino String.
-  char ssid_buf[sizeof(conf.sta.ssid) + 1] = {};
-  memcpy(ssid_buf, conf.sta.ssid, sizeof(conf.sta.ssid));
-  ssid_buf[sizeof(conf.sta.ssid)] = '\0';
-
-  char pass_buf[sizeof(conf.sta.password) + 1] = {};
-  memcpy(pass_buf, conf.sta.password, sizeof(conf.sta.password));
-  pass_buf[sizeof(conf.sta.password)] = '\0';
-
-  const String ssid(ssid_buf);
-  const String pass(pass_buf);
-
-  return tryConnectWithUi(ssid, pass, show_ui, true);
+  Serial.printf("Trying main WiFi: %s\n", ssid.c_str());
+  return tryConnectWithUi(ssid, pass, show_ui);
 }
 
 bool connectBackupNetwork(bool show_ui) {
@@ -474,9 +575,8 @@ bool connectBackupNetwork(bool show_ui) {
   if (ssid.length() == 0) {
     return false;
   }
-  Serial.printf("Primary WiFi failed — trying backup: %s\n", ssid.c_str());
-  // Keep the primary credentials in NVS: do not persist the backup ones.
-  if (!tryConnectWithUi(ssid, backupPass(), show_ui, false)) {
+  Serial.printf("Main WiFi failed — trying backup: %s\n", ssid.c_str());
+  if (!tryConnectWithUi(ssid, backupPass(), show_ui)) {
     return false;
   }
   s_on_backup_network = true;
@@ -506,6 +606,8 @@ bool openConfigPortal() {
   while (s_wm.getConfigPortalActive()) {
     bootButtonPollLongPress();
     if (s_wm.process()) {
+      s_on_backup_network = false;
+      services::location::useSecondary(false);
       return true;
     }
     delay(10);
