@@ -16,6 +16,7 @@ constexpr char kPrefsRangeKey[] = "rangeIdx";
 constexpr char kPrefsMilesKey[] = "useMiles";
 constexpr char kPrefsRunwaysKey[] = "showRwys";
 constexpr char kPrefsAltMetersKey[] = "altMeters";
+constexpr char kPrefsSweepKey[] = "sweep";
 constexpr uint8_t kDefaultRangeIndex = 1;  // 10 km ring
 constexpr float kKmPerMile = 1.609344f;
 
@@ -24,6 +25,7 @@ uint8_t s_range_index = kDefaultRangeIndex;
 bool s_use_miles = false;
 bool s_show_runways = true;
 bool s_alt_meters = false;
+bool s_sweep = true;
 
 void saveRangeIndex() {
   if (!s_prefs.begin(kPrefsNamespace, false)) {
@@ -57,6 +59,14 @@ void saveAltMeters() {
   s_prefs.end();
 }
 
+void saveSweep() {
+  if (!s_prefs.begin(kPrefsNamespace, false)) {
+    return;
+  }
+  s_prefs.putBool(kPrefsSweepKey, s_sweep);
+  s_prefs.end();
+}
+
 }  // namespace
 
 bool portalCheckboxChecked(const char* value) {
@@ -81,6 +91,7 @@ void rangeInit() {
   s_use_miles = s_prefs.getBool(kPrefsMilesKey, false);
   s_show_runways = s_prefs.getBool(kPrefsRunwaysKey, true);
   s_alt_meters = s_prefs.getBool(kPrefsAltMetersKey, false);
+  s_sweep = s_prefs.getBool(kPrefsSweepKey, true);
   s_prefs.end();
 }
 
@@ -106,6 +117,8 @@ bool showRunways() { return s_show_runways; }
 
 bool altitudeMeters() { return s_alt_meters; }
 
+bool sweepEnabled() { return s_sweep; }
+
 void saveMilesFromPortal(const char* checkbox_value) {
   s_use_miles = portalCheckboxChecked(checkbox_value);
   saveUseMiles();
@@ -122,6 +135,12 @@ void saveAltitudeUnitsFromPortal(const char* checkbox_value) {
   s_alt_meters = portalCheckboxChecked(checkbox_value);
   saveAltMeters();
   Serial.printf("Altitude units: %s\n", s_alt_meters ? "m" : "ft");
+}
+
+void saveSweepFromPortal(const char* checkbox_value) {
+  s_sweep = portalCheckboxChecked(checkbox_value);
+  saveSweep();
+  Serial.printf("Radar sweep: %s\n", s_sweep ? "on" : "off");
 }
 
 void formatRing3Label(char* buf, size_t len, float ring3_km, bool use_miles) {
@@ -142,10 +161,12 @@ void unitsReset() {
   s_use_miles = false;
   s_show_runways = true;
   s_alt_meters = false;
+  s_sweep = true;
   if (s_prefs.begin(kPrefsNamespace, false)) {
     s_prefs.remove(kPrefsMilesKey);
     s_prefs.remove(kPrefsRunwaysKey);
     s_prefs.remove(kPrefsAltMetersKey);
+    s_prefs.remove(kPrefsSweepKey);
     s_prefs.end();
   }
 }

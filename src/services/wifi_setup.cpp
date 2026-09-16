@@ -96,6 +96,10 @@ WiFiManagerParameter s_param_alt_meters("alt_meters", "Display altitude in meter
                                         2, s_alt_meters_checkbox_attrs,
                                         WFM_LABEL_AFTER);
 
+char s_sweep_checkbox_attrs[32] = "type=\"checkbox\"";
+WiFiManagerParameter s_param_sweep("sweep", "Animate the radar sweep", "T", 2,
+                                   s_sweep_checkbox_attrs, WFM_LABEL_AFTER);
+
 constexpr int kSsidParamLen = 32;
 constexpr int kPassParamLen = 64;
 constexpr char kSecondarySsidAttrs[] = " maxlength=\"32\"";
@@ -336,6 +340,9 @@ void refreshPortalParamDefaults() {
   snprintf(s_alt_meters_checkbox_attrs, sizeof(s_alt_meters_checkbox_attrs),
            "type=\"checkbox\"%s", ui::radar::altitudeMeters() ? " checked" : "");
   s_param_alt_meters.setValue("T", 2);
+  snprintf(s_sweep_checkbox_attrs, sizeof(s_sweep_checkbox_attrs),
+           "type=\"checkbox\"%s", ui::radar::sweepEnabled() ? " checked" : "");
+  s_param_sweep.setValue("T", 2);
   s_param_tz.setValue(services::timesync::posixTz(), kTzParamLen);
   char time_buf[kTimeParamLen];
   ui::radar::formatNightTime(time_buf, sizeof(time_buf), ui::radar::nightStartMinutes());
@@ -371,6 +378,7 @@ void onPortalParamsSaved() {
   ui::radar::saveMilesFromPortal(s_param_miles.getValue());
   ui::radar::saveRunwaysFromPortal(s_param_runways.getValue());
   ui::radar::saveAltitudeUnitsFromPortal(s_param_alt_meters.getValue());
+  ui::radar::saveSweepFromPortal(s_param_sweep.getValue());
   services::timesync::saveTimezoneFromPortal(s_param_tz.getValue());
   ui::radar::saveNightFromPortal(
       s_param_night_start.getValue(), s_param_night_end.getValue(),
@@ -410,6 +418,7 @@ void attachPortalParams(WiFiManager& wm) {
   wm.addParameter(&s_param_miles);
   wm.addParameter(&s_param_alt_meters);
   wm.addParameter(&s_param_runways);
+  wm.addParameter(&s_param_sweep);
   wm.addParameter(&s_param_night_header);
   wm.addParameter(&s_param_tz_select);
   wm.addParameter(&s_param_tz);

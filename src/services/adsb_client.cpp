@@ -23,29 +23,40 @@ constexpr int kConnectAttemptMs = 200;
 constexpr unsigned long kRequestTimeoutMs = 10000;
 
 // Allocated on first use so the display frame buffer gets the large contiguous
-// DRAM block first.
+// DRAM block first. The task only ever writes s_staging, the UI only ever reads
+// s_aircraft, and the two are swapped by consumeUpdate() between frames.
 Aircraft* s_aircraft = nullptr;
+Aircraft* s_staging = nullptr;
 size_t s_aircraft_count = 0;
-PollFn s_poll_fn = nullptr;
+size_t s_staging_count = 0;
 
-bool ensureAircraftTable() {
+enum class FetchState : uint8_t { kIdle, kBusy, kReady };
+
+volatile FetchState s_state = FetchState::kIdle;
+volatile bool s_fetch_ok = false;
+TaskHandle_t s_task = nullptr;
+double s_request_lat = 0.0;
+double s_request_lon = 0.0;
+float s_request_radius_km = 0.0f;
+
+constexpr uint32_t kTaskStackWords = 12288;
+constexpr UBaseType_t kTaskPriority = 1;
+constexpr BaseType_t kTaskCore = 0;  // core 1 runs loop() and the display SPI
+
+bool ensureAircraftTables() {
   if (s_aircraft == nullptr) {
     s_aircraft = static_cast<Aircraft*>(calloc(kMaxAircraft, sizeof(Aircraft)));
   }
-  return s_aircraft != nullptr;
-}
-
-void pollNetwork() {
-  if (s_poll_fn != nullptr) {
-    s_poll_fn();
+  if (s_staging == nullptr) {
+    s_staging = static_cast<Aircraft*>(calloc(kMaxAircraft, sizeof(Aircraft)));
   }
+  return s_aircraft != nullptr && s_staging != nullptr;
 }
 
-int performGetWithPoll(HTTPClient& http) {
+int performGet(HTTPClient& http) {
   http.setConnectTimeout(kConnectAttemptMs);
   const unsigned long deadline = millis() + kRequestTimeoutMs;
   while (millis() < deadline) {
-    pollNetwork();
     const int code = http.GET();
     if (code > 0) {
       return code;
@@ -59,7 +70,7 @@ int performGetWithPoll(HTTPClient& http) {
   return HTTPC_ERROR_READ_TIMEOUT;
 }
 
-bool readResponseBodyWithPoll(HTTPClient& http, String& payload) {
+bool readResponseBody(HTTPClient& http, String& payload) {
   WiFiClient* stream = http.getStreamPtr();
   if (stream == nullptr) {
     return false;
@@ -73,7 +84,6 @@ bool readResponseBodyWithPoll(HTTPClient& http, String& payload) {
   uint8_t buffer[512];
   const unsigned long deadline = millis() + kRequestTimeoutMs;
   while (millis() < deadline) {
-    pollNetwork();
     const int available = stream->available();
     if (available > 0) {
       const int to_read =
@@ -216,15 +226,7 @@ void fillTagFields(Aircraft* ac, const JsonObject& plane) {
   formatAltitudeTag(plane, ac->alt, sizeof(ac->alt));
 }
 
-}  // namespace
-
-void setPollFn(PollFn fn) { s_poll_fn = fn; }
-
-size_t aircraftCount() { return s_aircraft_count; }
-
-const Aircraft* aircraftList() { return s_aircraft; }
-
-bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
+bool runFetch(double center_lat, double center_lon, float fetch_radius_km) {
   const float dist_nm = kmToNauticalMiles(fetch_radius_km);
 
   String url = kApiBase;
@@ -245,7 +247,7 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
 
   http.useHTTP10(true);
   http.setTimeout(kRequestTimeoutMs);
-  const int code = performGetWithPoll(http);
+  const int code = performGet(http);
   if (code != HTTP_CODE_OK) {
     Serial.printf("adsb: HTTP %d\n", code);
     http.end();
@@ -253,7 +255,7 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   }
 
   String payload;
-  if (!readResponseBodyWithPoll(http, payload)) {
+  if (!readResponseBody(http, payload)) {
     Serial.println("adsb: empty response");
     http.end();
     return false;
@@ -275,11 +277,11 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
 
   JsonArray ac = doc["ac"].as<JsonArray>();
   if (ac.isNull()) {
-    s_aircraft_count = 0;
+    s_staging_count = 0;
     return true;
   }
 
-  if (!ensureAircraftTable()) {
+  if (!ensureAircraftTables()) {
     Serial.println("adsb: aircraft table alloc failed");
     return false;
   }
@@ -296,18 +298,69 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
       continue;
     }
 
-    s_aircraft[n].lat = plane["lat"].as<float>();
-    s_aircraft[n].lon = plane["lon"].as<float>();
-    s_aircraft[n].nose_deg = pickNoseHeading(plane);
-    s_aircraft[n].track_deg = pickTrackHeading(plane);
-    s_aircraft[n].gs_knots = pickGroundSpeed(plane);
-    fillTagFields(&s_aircraft[n], plane);
+    s_staging[n].lat = plane["lat"].as<float>();
+    s_staging[n].lon = plane["lon"].as<float>();
+    s_staging[n].nose_deg = pickNoseHeading(plane);
+    s_staging[n].track_deg = pickTrackHeading(plane);
+    s_staging[n].gs_knots = pickGroundSpeed(plane);
+    fillTagFields(&s_staging[n], plane);
     ++n;
   }
 
-  s_aircraft_count = n;
+  s_staging_count = n;
   Serial.printf("adsb: %u aircraft\n", static_cast<unsigned>(n));
   return true;
+}
+
+void fetchTask(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    s_fetch_ok = runFetch(s_request_lat, s_request_lon, s_request_radius_km);
+    s_state = FetchState::kReady;
+  }
+}
+
+}  // namespace
+
+size_t aircraftCount() { return s_aircraft_count; }
+
+const Aircraft* aircraftList() { return s_aircraft; }
+
+void begin() {
+  if (s_task != nullptr || !ensureAircraftTables()) {
+    return;
+  }
+  // Pinned to core 0: the TLS handshake blocks for a while and loop() must keep
+  // animating on core 1.
+  xTaskCreatePinnedToCore(fetchTask, "adsb", kTaskStackWords, nullptr, kTaskPriority,
+                          &s_task, kTaskCore);
+}
+
+bool requestUpdate(double center_lat, double center_lon, float fetch_radius_km) {
+  if (s_task == nullptr || s_state != FetchState::kIdle) {
+    return false;
+  }
+  s_request_lat = center_lat;
+  s_request_lon = center_lon;
+  s_request_radius_km = fetch_radius_km;
+  s_state = FetchState::kBusy;
+  xTaskNotifyGive(s_task);
+  return true;
+}
+
+bool consumeUpdate() {
+  if (s_state != FetchState::kReady) {
+    return false;
+  }
+  const bool ok = s_fetch_ok;
+  if (ok) {
+    Aircraft* const published = s_aircraft;
+    s_aircraft = s_staging;
+    s_aircraft_count = s_staging_count;
+    s_staging = published;
+  }
+  s_state = FetchState::kIdle;
+  return ok;
 }
 
 }  // namespace services::adsb

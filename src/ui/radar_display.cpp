@@ -22,6 +22,7 @@ namespace radar {
 
 uint16_t kColorBackground = 0x0000;
 uint16_t kColorGrid = 0x0320;
+uint16_t kColorSweep = 0x07E0;
 uint16_t kColorLabel = 0xFFFF;
 uint16_t kColorCenter = 0xFFFF;
 uint16_t kColorAircraft = 0x001F;
@@ -164,8 +165,11 @@ class DirtyRegion {
 
 DirtyRegion s_dirty_current;
 DirtyRegion s_dirty_previous;
+DirtyRegion s_sweep_current;
+DirtyRegion s_sweep_previous;
 DirtyRegion* s_dirty_sink = nullptr;
 bool s_panel_matches_frame = false;
+unsigned long s_last_sweep_ms = 0;
 
 void markDirty(int l, int t, int r, int b) {
   if (s_dirty_sink != nullptr) {
@@ -428,13 +432,41 @@ constexpr NightRgb kNightAircraft{195, 40, 40};
 constexpr NightRgb kNightTrack{255, 112, 112};
 constexpr NightRgb kNightRunway{60, 0, 0};
 constexpr NightRgb kNightRunwayLabel{104, 8, 8};
+constexpr NightRgb kNightSweep{150, 16, 16};
 constexpr uint8_t kNightDimPercent = 40;
 
 radar::NightStyle s_night_style = radar::NightStyle::kNone;
 bool s_palette_changed = false;
 
+/** Channel order as the panel wants it, so the sweep trail can be blended. */
+struct PanelRgb {
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+};
+
+PanelRgb s_sweep_panel_rgb{40, 220, 90};
+PanelRgb s_background_panel_rgb{0, 0, 0};
+
+uint8_t mixChannel(uint8_t from, uint8_t to, float f) {
+  const int delta = static_cast<int>(to) - static_cast<int>(from);
+  return static_cast<uint8_t>(static_cast<int>(from) + static_cast<int>(delta * f));
+}
+
+uint16_t blendPanelRgb(const PanelRgb& from, const PanelRgb& to, float f) {
+  return tft.color565(mixChannel(from.r, to.r, f), mixChannel(from.g, to.g, f),
+                      mixChannel(from.b, to.b, f));
+}
+
 uint8_t scaleChannel(uint8_t value, uint8_t percent) {
   return static_cast<uint8_t>((static_cast<uint16_t>(value) * percent) / 100);
+}
+
+PanelRgb scaledPanelRgb(uint8_t r, uint8_t g, uint8_t b, uint8_t percent, bool swap_rb) {
+  const uint8_t sr = scaleChannel(r, percent);
+  const uint8_t sg = scaleChannel(g, percent);
+  const uint8_t sb = scaleChannel(b, percent);
+  return swap_rb ? PanelRgb{sb, sg, sr} : PanelRgb{sr, sg, sb};
 }
 
 uint16_t dayColor(uint8_t r, uint8_t g, uint8_t b, uint8_t percent) {
@@ -462,6 +494,11 @@ void initPalette() {
   if (style == radar::NightStyle::kRed) {
     radar::kColorBackground = nightColor(kNightBackground, pct);
     radar::kColorGrid = nightColor(kNightGrid, pct);
+    radar::kColorSweep = nightColor(kNightSweep, pct);
+    s_sweep_panel_rgb =
+        scaledPanelRgb(kNightSweep.r, kNightSweep.g, kNightSweep.b, pct, true);
+    s_background_panel_rgb = scaledPanelRgb(kNightBackground.r, kNightBackground.g,
+                                            kNightBackground.b, pct, true);
     radar::kColorLabel = nightColor(kNightLabel, pct);
     radar::kColorCenter = nightColor(kNightCenter, pct);
     // Symbol and its tag text share one tone; the speed vector is the palest.
@@ -477,6 +514,11 @@ void initPalette() {
 
   radar::kColorBackground = dayColor(radar::kBgR, radar::kBgG, radar::kBgB, pct);
   radar::kColorGrid = dayColor(radar::kGridR, radar::kGridG, radar::kGridB, pct);
+  radar::kColorSweep = dayColor(radar::kSweepR, radar::kSweepG, radar::kSweepB, pct);
+  s_sweep_panel_rgb =
+      scaledPanelRgb(radar::kSweepR, radar::kSweepG, radar::kSweepB, pct, false);
+  s_background_panel_rgb =
+      scaledPanelRgb(radar::kBgR, radar::kBgG, radar::kBgB, pct, false);
   radar::kColorLabel = dayColor(255, 255, 255, pct);
   radar::kColorCenter = dayColor(255, 255, 255, pct);
   // GC9A01 BGR panel: swap R/B in color565 so logical red renders red on screen.
@@ -1201,6 +1243,55 @@ void drawRings(int cx, int cy, int outer_radius) {
   }
 }
 
+/** Bounding box of a wedge: the centre plus samples along its outer arc. */
+void markSweepDirty(int cx, int cy, int radius, float start_deg, float end_deg) {
+  constexpr int kSamples = 12;
+  int l = cx;
+  int t = cy;
+  int r = cx;
+  int b = cy;
+  for (int i = 0; i <= kSamples; ++i) {
+    const float deg =
+        start_deg + (end_deg - start_deg) * (static_cast<float>(i) / kSamples);
+    const float rad = (deg - 90.0f) * kDegToRad;
+    const int x = cx + static_cast<int>(cosf(rad) * radius);
+    const int y = cy + static_cast<int>(sinf(rad) * radius);
+    l = std::min(l, x);
+    t = std::min(t, y);
+    r = std::max(r, x);
+    b = std::max(b, y);
+  }
+  markDirty(l, t, r, b);
+}
+
+// Drawn before the grid so rings, runways and labels stay readable on top of it.
+void drawSweep(int cx, int cy, int radius) {
+  if (!radar::sweepEnabled()) {
+    return;
+  }
+
+  const unsigned long phase = millis() % radar::kSweepPeriodMs;
+  const float head_deg = static_cast<float>(phase) * 360.0f /
+                         static_cast<float>(radar::kSweepPeriodMs);
+  const float slice_deg =
+      radar::kSweepTrailDeg / static_cast<float>(radar::kSweepTrailSlices);
+
+  for (int i = 0; i < radar::kSweepTrailSlices; ++i) {
+    const float fade = 1.0f - static_cast<float>(i) / radar::kSweepTrailSlices;
+    const float level = radar::kSweepTrailPeak * fade * fade;
+    const float trailing = head_deg - static_cast<float>(i) * slice_deg;
+    s_draw->fillArc(cx, cy, 0, radius, trailing - slice_deg - 90.0f, trailing - 90.0f,
+                    blendPanelRgb(s_background_panel_rgb, s_sweep_panel_rgb, level));
+  }
+
+  const float head_rad = (head_deg - 90.0f) * kDegToRad;
+  s_draw->drawWideLine(cx, cy, cx + static_cast<int>(cosf(head_rad) * radius),
+                       cy + static_cast<int>(sinf(head_rad) * radius),
+                       radar::kSweepLineHalfWidth, radar::kColorSweep);
+
+  markSweepDirty(cx, cy, radius, head_deg - radar::kSweepTrailDeg, head_deg);
+}
+
 void drawCrosshairs(int cx, int cy, int radius, uint16_t color) {
   s_draw->drawWideLine(cx, cy - radius, cx, cy + radius,
                        radar::kGridStrokeHalfWidth, color);
@@ -1246,6 +1337,7 @@ void drawStaticGrid(Gfx& gfx) {
   const int grid_r = radar::kGridOuterRadius;
 
   gfx.fillScreen(radar::kColorBackground);
+  drawSweep(cx, cy, grid_r);
   drawRings(cx, cy, grid_r);
   drawCrosshairs(cx, cy, grid_r, radar::kColorGrid);
   initPalette();
@@ -1284,10 +1376,19 @@ void pushRegion(const DirtyRegion& region) {
 
 // The whole frame is composed off-screen, but only the boxes touched this frame
 // or the previous one are blitted, so the static grid is never re-sent over SPI.
-void renderFrame(bool force_full) {
-  s_dirty_current.clear();
-  s_dirty_sink = &s_dirty_current;
+// Sweep-only frames keep the aircraft boxes out of the push: the planes have not
+// moved, and the pixels the wedge passed under are inside the sweep region anyway.
+void renderFrame(bool force_full, bool sweep_only = false) {
+  s_sweep_current.clear();
+  s_dirty_sink = &s_sweep_current;
   drawStaticGrid(s_frame);  // opens its own DrawScope(s_frame)
+
+  if (!sweep_only) {
+    s_dirty_current.clear();
+    s_dirty_sink = &s_dirty_current;
+  } else {
+    s_dirty_sink = nullptr;
+  }
   {
     const DrawScope scope(s_frame);
     drawAircraft();
@@ -1298,12 +1399,19 @@ void renderFrame(bool force_full) {
     s_palette_changed = false;
     s_frame.pushSprite(0, 0);
   } else {
-    DirtyRegion update = s_dirty_previous;
-    update.addAll(s_dirty_current);
+    DirtyRegion update = s_sweep_previous;
+    update.addAll(s_sweep_current);
+    if (!sweep_only) {
+      update.addAll(s_dirty_previous);
+      update.addAll(s_dirty_current);
+    }
     pushRegion(update);
   }
 
-  s_dirty_previous = s_dirty_current;
+  s_sweep_previous = s_sweep_current;
+  if (!sweep_only) {
+    s_dirty_previous = s_dirty_current;
+  }
   s_panel_matches_frame = true;
   tft.setTextDatum(textdatum_t::top_left);
 }
@@ -1349,6 +1457,20 @@ void radarDisplayRefreshAircraft() {
 
 bool radarDisplayNightStyleChanged() {
   return radar::nightStyle() != s_night_style;
+}
+
+void radarDisplayAnimate() {
+  // Without the off-screen buffer every frame would repaint the panel directly.
+  if (!radar::sweepEnabled() || !s_frame_ready) {
+    return;
+  }
+  const unsigned long now = millis();
+  if (now - s_last_sweep_ms < radar::kSweepFrameIntervalMs) {
+    return;
+  }
+  s_last_sweep_ms = now;
+  initPalette();
+  renderFrame(false, true);
 }
 
 }  // namespace ui

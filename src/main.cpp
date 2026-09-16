@@ -55,15 +55,16 @@ void handleBootButton() {
   }
 }
 
-void fetchAndDrawAircraft() {
-  const float fetch_km = ui::radar::fetchRadiusKm();
-  if (!services::adsb::fetchUpdate(services::location::lat(),
-                                   services::location::lon(), fetch_km)) {
-    handleBootButton();
-    return;
+void serviceAircraftFeed() {
+  if (services::adsb::consumeUpdate()) {
+    ui::radarDisplayRefreshAircraft();
   }
-  ui::radarDisplayRefreshAircraft();
-  handleBootButton();
+  if (millis() - g_last_adsb_fetch_ms >= config::kAdsbFetchIntervalMs) {
+    g_last_adsb_fetch_ms = millis();
+    services::adsb::requestUpdate(services::location::lat(),
+                                  services::location::lon(),
+                                  ui::radar::fetchRadiusKm());
+  }
 }
 
 }  // namespace
@@ -84,7 +85,7 @@ void setup() {
   ui::radar::rangeInit();
   services::timesync::init();
   ui::radar::nightInit();
-  services::adsb::setPollFn(wifiLoop);
+  services::adsb::begin();
 
   if (wifiSetupConnect()) {
     showRadarIfConnected();
@@ -125,9 +126,9 @@ void loop() {
     g_wifi_down_since = 0;
     if (!g_radar_visible) {
       showRadarIfConnected();
-    } else if (millis() - g_last_adsb_fetch_ms >= config::kAdsbFetchIntervalMs) {
-      g_last_adsb_fetch_ms = millis();
-      fetchAndDrawAircraft();
+    } else {
+      serviceAircraftFeed();
+      ui::radarDisplayAnimate();
     }
   }
 

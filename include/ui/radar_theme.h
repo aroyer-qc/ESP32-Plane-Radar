@@ -31,6 +31,16 @@ constexpr float kGridStrokeHalfWidth = 1.0f;
 
 constexpr int kCenterDotRadius = 2;
 
+/** Radar sweep: one revolution, and the animation tick that drives it. */
+constexpr unsigned long kSweepPeriodMs = 4000;
+constexpr unsigned long kSweepFrameIntervalMs = 40;
+/** Persistence trail behind the leading edge, split into blended slices. */
+constexpr float kSweepTrailDeg = 70.0f;
+constexpr int kSweepTrailSlices = 14;
+/** Strongest trail blend, right behind the leading edge (0..1). */
+constexpr float kSweepTrailPeak = 0.55f;
+constexpr float kSweepLineHalfWidth = 1.0f;
+
 /** Filled aircraft symbol (nose triangle). */
 constexpr int kAircraftNoseLenPx = 8;
 constexpr int kAircraftTailLenPx = 3;
@@ -69,6 +79,9 @@ constexpr uint8_t kBgB = 28;
 constexpr uint8_t kGridR = 16;
 constexpr uint8_t kGridG = 100;
 constexpr uint8_t kGridB = 32;
+constexpr uint8_t kSweepR = 40;
+constexpr uint8_t kSweepG = 220;
+constexpr uint8_t kSweepB = 90;
 constexpr uint8_t kAircraftR = 255;
 constexpr uint8_t kAircraftG = 0;
 constexpr uint8_t kAircraftB = 0;
@@ -91,6 +104,7 @@ constexpr uint8_t kRunwayLabelB = 230;
 
 extern uint16_t kColorBackground;
 extern uint16_t kColorGrid;
+extern uint16_t kColorSweep;
 extern uint16_t kColorLabel;
 extern uint16_t kColorCenter;
 extern uint16_t kColorAircraft;

@@ -14,4 +14,7 @@ void radarDisplayRefreshAircraft();
 /** True when the night schedule moved to another palette since the last draw. */
 bool radarDisplayNightStyleChanged();
 
+/** Advances the radar sweep; call as often as possible, it rate-limits itself. */
+void radarDisplayAnimate();
+
 }  // namespace ui

@@ -47,10 +47,13 @@ bool useMiles();
 bool showRunways();
 /** True when aircraft altitudes are shown in metres instead of feet. */
 bool altitudeMeters();
+/** True when the rotating sweep is animated. */
+bool sweepEnabled();
 /** WiFi portal checkbox: "T" = miles, otherwise km. */
 void saveMilesFromPortal(const char* checkbox_value);
 void saveRunwaysFromPortal(const char* checkbox_value);
 void saveAltitudeUnitsFromPortal(const char* checkbox_value);
+void saveSweepFromPortal(const char* checkbox_value);
 /** True when a WiFiManager checkbox came back ticked. */
 bool portalCheckboxChecked(const char* value);
 void formatRing3Label(char* buf, size_t len, float ring3_km, bool use_miles);
